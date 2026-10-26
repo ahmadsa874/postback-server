@@ -1,0 +1,29 @@
+const express = require('express');
+const app = express();
+
+app.get('/', (req, res) => {
+    res.send('Game Rewards Postback Server is Running Securely!');
+});
+
+// الرابط الذي سنعطيه لشركة UPWALL
+app.get('/upwall-postback', (req, res) => {
+    // جلب بيانات المستخدم والنقاط التي أرسلتها الشركة
+    const subId = req.query.subId; // الـ ID الخاص بالمستخدم في تطبيقك
+    const reward = req.query.reward; // عدد الكوينز
+    
+    console.log(`Received Postback: User ${subId} earned ${reward} coins.`);
+
+    if (!subId || !reward) {
+        return res.status(400).send('Missing required parameters');
+    }
+
+    // (سنضع كود Firebase هنا لاحقاً لزيادة الرصيد في قاعدة البيانات)
+
+    // يجب إرسال "1" أو "200" للشركة لتأكيد استلام النقاط بنجاح
+    res.status(200).send('1');
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
+});
