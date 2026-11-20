@@ -21,9 +21,18 @@ const db = admin.firestore();
 
 const MAX_SINGLE_REWARD = 500000;
 const AD_REWARD_COINS = 13;
-const AD_COOLDOWN_MS = 4 * 60 * 1000; // 4 دقائق بتوقيت السيرفر الحقيقي
+const AD_COOLDOWN_MS = 4 * 60 * 1000;        // 4 دقائق بتوقيت السيرفر
+const DAILY_COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24 ساعة للعجلة والبطاقة
 
-// كتالوج الجوائز الرسمي على السيرفر (يمنع تزوير الأسعار من التطبيق)
+// جوائز واحتمالات عجلة الحظ (مجموع الأوزان = 10000)
+const WHEEL_PRIZES = [2, 5, 8, 15, 25, 50, 100, 500];
+const WHEEL_WEIGHTS = [5000, 3500, 1200, 150, 80, 50, 18, 2];
+
+// جوائز واحتمالات بطاقة المسح (مجموع الأوزان = 1000)
+const SCRATCH_PRIZES = [5, 10, 20, 50, 100, 250];
+const SCRATCH_WEIGHTS = [400, 300, 150, 100, 40, 10];
+
+// كتالوج الجوائز الرسمي على السيرفر (يمنع تزوير الأسعار)
 const REWARDS_CATALOG = {
   google_play_20: { title: 'Google Play $20', cost: 250000, category: 'Google Play', imageUrl: 'assets/images/google_play.jpg' },
   amazon_20:      { title: 'Amazon $20', cost: 250000, category: 'Amazon', imageUrl: 'assets/images/amazon.png' },
@@ -35,7 +44,6 @@ const REWARDS_CATALOG = {
   pubg660:        { title: '660 PUBG Mobile UC', cost: 130000, category: 'PUBG Mobile', imageUrl: 'assets/images/pubg.jpg' },
 };
 
-// حماية ضد الإغراق
 const postbackLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 60,
@@ -49,7 +57,7 @@ const apiLimiter = rateLimit({
   max: 30,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Too many requests, slow down.' },
+  message: { success: false, error: 'TOO_MANY_REQUESTS' },
 });
 
 function isValidSecret(provided, expected) {
@@ -72,11 +80,22 @@ function getTodayUtcKey() {
   return `${y}-${m}-${d}`;
 }
 
-// 🛡️ التحقق من توكن المستخدم المسجّل في Firebase Auth
+function pickWeightedIndex(weights) {
+  const total = weights.reduce((a, b) => a + b, 0);
+  const r = crypto.randomInt(0, total);
+  let cumulative = 0;
+  for (let i = 0; i < weights.length; i++) {
+    cumulative += weights[i];
+    if (r < cumulative) return i;
+  }
+  return 0;
+}
+
+// التحقق من توكن Firebase Auth
 async function verifyFirebaseToken(req, res, next) {
   const authHeader = req.headers.authorization || '';
   if (!authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Missing Authorization token' });
+    return res.status(401).json({ success: false, error: 'MISSING_TOKEN' });
   }
   const idToken = authHeader.slice(7).trim();
   try {
@@ -85,7 +104,7 @@ async function verifyFirebaseToken(req, res, next) {
     req.userEmail = decoded.email || 'Unknown';
     return next();
   } catch (err) {
-    return res.status(401).json({ error: 'Invalid or expired token' });
+    return res.status(401).json({ success: false, error: 'INVALID_TOKEN' });
   }
 }
 
@@ -110,6 +129,7 @@ async function creditUserCoins(uid, amount, network, offerId) {
 
   const txRef = db.collection('completed_offers').doc(txId);
   const userRef = db.collection('users').doc(uid);
+  const challengeRef = userRef.collection('activity').doc('challenges');
 
   await db.runTransaction(async (t) => {
     const txDoc = await t.get(txRef);
@@ -149,6 +169,12 @@ async function creditUserCoins(uid, amount, network, offerId) {
       offerId: String(offerId || 'unknown'),
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
+
+    // زيادة عداد العروض المكتملة تلقائياً لتحدي الـ 5 عروض
+    t.set(challengeRef, {
+      monlix_count: admin.firestore.FieldValue.increment(1),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
   });
 }
 
@@ -203,10 +229,10 @@ app.get('/admantum-postback', postbackLimiter, async (req, res) => {
 });
 
 // ==========================================
-// 2. مسارات التطبيق المحمية (Server-Side Validation)
+// 2. مسارات التطبيق المحمية (Server-Side)
 // ==========================================
 
-// 🎬 مكافأة الإعلانات (غير محدود • كل 4 دقائق بتوقيت السيرفر • 13 عملة)
+// 🎬 مكافأة الإعلانات (غير محدود • كل 4 دقائق • 13 عملة)
 app.post('/api/claim-ad', apiLimiter, verifyFirebaseToken, async (req, res) => {
   try {
     const uid = req.uid;
@@ -217,9 +243,7 @@ app.post('/api/claim-ad', apiLimiter, verifyFirebaseToken, async (req, res) => {
     const result = await db.runTransaction(async (t) => {
       const userDoc = await t.get(userRef);
       if (!userDoc.exists) throw { status: 404, message: 'USER_NOT_FOUND' };
-
-      const userData = userDoc.data() || {};
-      if (userData.isBanned === true) throw { status: 403, message: 'USER_BANNED' };
+      if (userDoc.data()?.isBanned === true) throw { status: 403, message: 'USER_BANNED' };
 
       const adDoc = await t.get(adRef);
       const adData = adDoc.exists ? (adDoc.data() || {}) : {};
@@ -263,7 +287,181 @@ app.post('/api/claim-ad', apiLimiter, verifyFirebaseToken, async (req, res) => {
   }
 });
 
-// 🤝 تطبيق كود الإحالة بأمان (+100 للمستخدم، +50 لصاحب الكود)
+// 🎡 عجلة الحظ اليومية (كل 24 ساعة • اختيار الجائزة على السيرفر)
+app.post('/api/spin-wheel', apiLimiter, verifyFirebaseToken, async (req, res) => {
+  try {
+    const uid = req.uid;
+    const userRef = db.collection('users').doc(uid);
+    const wheelRef = userRef.collection('activity').doc('wheel');
+
+    const result = await db.runTransaction(async (t) => {
+      const userDoc = await t.get(userRef);
+      if (!userDoc.exists) throw { status: 404, message: 'USER_NOT_FOUND' };
+      if (userDoc.data()?.isBanned === true) throw { status: 403, message: 'USER_BANNED' };
+
+      const wheelDoc = await t.get(wheelRef);
+      const wheelData = wheelDoc.exists ? (wheelDoc.data() || {}) : {};
+
+      if (wheelData.last_daily_spin_time && typeof wheelData.last_daily_spin_time.toMillis === 'function') {
+        const elapsedMs = Date.now() - wheelData.last_daily_spin_time.toMillis();
+        if (elapsedMs < DAILY_COOLDOWN_MS) {
+          const remainingSeconds = Math.ceil((DAILY_COOLDOWN_MS - elapsedMs) / 1000);
+          throw { status: 429, message: 'COOLDOWN', remainingSeconds };
+        }
+      }
+
+      const prizeIndex = pickWeightedIndex(WHEEL_WEIGHTS);
+      const reward = WHEEL_PRIZES[prizeIndex];
+
+      t.update(userRef, {
+        coins: admin.firestore.FieldValue.increment(reward),
+        lastUpdate: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      t.set(wheelRef, {
+        last_daily_spin_time: admin.firestore.FieldValue.serverTimestamp(),
+        last_reward: reward,
+      }, { merge: true });
+
+      return { prizeIndex, reward };
+    });
+
+    return res.status(200).json({ success: true, ...result });
+  } catch (err) {
+    if (err && err.status) {
+      return res.status(err.status).json({
+        success: false,
+        error: err.message,
+        remainingSeconds: err.remainingSeconds || 0,
+      });
+    }
+    console.error('❌ /api/spin-wheel Error:', err);
+    return res.status(500).json({ success: false, error: 'SERVER_ERROR' });
+  }
+});
+
+// 🎫 بطاقة الحظ اليومية (كل 24 ساعة • اختيار الجائزة على السيرفر)
+app.post('/api/scratch-card', apiLimiter, verifyFirebaseToken, async (req, res) => {
+  try {
+    const uid = req.uid;
+    const userRef = db.collection('users').doc(uid);
+    const scratchRef = userRef.collection('activity').doc('scratch');
+
+    const result = await db.runTransaction(async (t) => {
+      const userDoc = await t.get(userRef);
+      if (!userDoc.exists) throw { status: 404, message: 'USER_NOT_FOUND' };
+      if (userDoc.data()?.isBanned === true) throw { status: 403, message: 'USER_BANNED' };
+
+      const scratchDoc = await t.get(scratchRef);
+      const scratchData = scratchDoc.exists ? (scratchDoc.data() || {}) : {};
+
+      if (scratchData.last_daily_scratch_time && typeof scratchData.last_daily_scratch_time.toMillis === 'function') {
+        const elapsedMs = Date.now() - scratchData.last_daily_scratch_time.toMillis();
+        if (elapsedMs < DAILY_COOLDOWN_MS) {
+          const remainingSeconds = Math.ceil((DAILY_COOLDOWN_MS - elapsedMs) / 1000);
+          throw { status: 429, message: 'COOLDOWN', remainingSeconds };
+        }
+      }
+
+      const prizeIndex = pickWeightedIndex(SCRATCH_WEIGHTS);
+      const reward = SCRATCH_PRIZES[prizeIndex];
+
+      t.update(userRef, {
+        coins: admin.firestore.FieldValue.increment(reward),
+        lastUpdate: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      t.set(scratchRef, {
+        last_daily_scratch_time: admin.firestore.FieldValue.serverTimestamp(),
+        last_reward: reward,
+      }, { merge: true });
+
+      return { reward };
+    });
+
+    return res.status(200).json({ success: true, ...result });
+  } catch (err) {
+    if (err && err.status) {
+      return res.status(err.status).json({
+        success: false,
+        error: err.message,
+        remainingSeconds: err.remainingSeconds || 0,
+      });
+    }
+    console.error('❌ /api/scratch-card Error:', err);
+    return res.status(500).json({ success: false, error: 'SERVER_ERROR' });
+  }
+});
+
+// 🏆 تحديات الألعاب (الدخول اليومي + التقييم + إتمام 5 عروض)
+app.post('/api/claim-challenge', apiLimiter, verifyFirebaseToken, async (req, res) => {
+  try {
+    const uid = req.uid;
+    const type = String(req.body.type || '').trim();
+    const today = getTodayUtcKey();
+
+    if (!['daily_login', 'rate_app', 'five_offers'].includes(type)) {
+      return res.status(400).json({ success: false, error: 'INVALID_CHALLENGE' });
+    }
+
+    const userRef = db.collection('users').doc(uid);
+    const challengeRef = userRef.collection('activity').doc('challenges');
+
+    const result = await db.runTransaction(async (t) => {
+      const userDoc = await t.get(userRef);
+      if (!userDoc.exists) throw { status: 404, message: 'USER_NOT_FOUND' };
+      if (userDoc.data()?.isBanned === true) throw { status: 403, message: 'USER_BANNED' };
+
+      const chDoc = await t.get(challengeRef);
+      const chData = chDoc.exists ? (chDoc.data() || {}) : {};
+
+      let reward = 0;
+      const updates = { updatedAt: admin.firestore.FieldValue.serverTimestamp() };
+
+      if (type === 'daily_login') {
+        if (chData.last_login_date === today) {
+          throw { status: 400, message: 'ALREADY_CLAIMED' };
+        }
+        reward = 5;
+        updates.last_login_date = today;
+      } else if (type === 'rate_app') {
+        if (chData.rated_app === true) {
+          throw { status: 400, message: 'ALREADY_CLAIMED' };
+        }
+        reward = 30;
+        updates.rated_app = true;
+        updates.ratedAt = admin.firestore.FieldValue.serverTimestamp();
+      } else if (type === 'five_offers') {
+        if (chData.five_offers_claimed === true) {
+          throw { status: 400, message: 'ALREADY_CLAIMED' };
+        }
+        if ((chData.monlix_count || 0) < 5) {
+          throw { status: 400, message: 'NOT_ELIGIBLE' };
+        }
+        reward = 300;
+        updates.five_offers_claimed = true;
+      }
+
+      t.update(userRef, {
+        coins: admin.firestore.FieldValue.increment(reward),
+        lastUpdate: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      t.set(challengeRef, updates, { merge: true });
+      return { reward };
+    });
+
+    return res.status(200).json({ success: true, ...result });
+  } catch (err) {
+    if (err && err.status) {
+      return res.status(err.status).json({ success: false, error: err.message });
+    }
+    console.error('❌ /api/claim-challenge Error:', err);
+    return res.status(500).json({ success: false, error: 'SERVER_ERROR' });
+  }
+});
+
+// 🤝 تطبيق كود الإحالة (+100 للمستخدم، +50 لصاحب الكود)
 app.post('/api/apply-referral', apiLimiter, verifyFirebaseToken, async (req, res) => {
   try {
     const uid = req.uid;
@@ -310,7 +508,7 @@ app.post('/api/apply-referral', apiLimiter, verifyFirebaseToken, async (req, res
   }
 });
 
-// 💳 سحب الجوائز عبر السيرفر (يمنع تزوير السعر أو السحب المزدوج)
+// 💳 سحب الجوائز عبر السيرفر
 app.post('/api/redeem', apiLimiter, verifyFirebaseToken, async (req, res) => {
   try {
     const uid = req.uid;
