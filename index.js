@@ -111,14 +111,23 @@ async function creditUserCoins(uid, amount, network, offerId) {
   });
 }
 
-// 1. مسار UPWALL المحمي بكلمة السر
+// 1. مسار UPWALL المحمي بكلمة السر + تشخيص دقيق للرفض
 app.get('/upwall-postback', postbackLimiter, async (req, res) => {
   try {
-    const expectedPassword = process.env.UPWALL_POSTBACK_PASSWORD;
-    const providedPassword = req.query.password || req.query.secret;
+    const expectedPassword = (process.env.UPWALL_POSTBACK_PASSWORD || '').trim();
+    const providedPassword = String(
+      req.query.password || req.query.secret || req.query.pass || ''
+    ).trim();
 
     if (!isValidSecret(providedPassword, expectedPassword)) {
-      console.warn(`🚫 Unauthorized UPWALL postback attempt from IP: ${req.ip}`);
+      console.warn('🚫 Unauthorized UPWALL postback:', {
+        ip: req.ip,
+        queryKeys: Object.keys(req.query),
+        hasPasswordParam: Boolean(req.query.password),
+        providedLen: providedPassword.length,
+        expectedLen: expectedPassword.length,
+        hasSignatureParam: Boolean(req.query.signature || req.query.hash || req.query.sig),
+      });
       return res.status(403).send('Forbidden');
     }
 
