@@ -5,7 +5,7 @@ const rateLimit = require('express-rate-limit');
 
 const app = express();
 app.set('trust proxy', 1);
-app.use(express.json());
+app.use(express.json({ limit: '50kb' }));
 
 // تهيئة Firebase Admin
 if (process.env.FIREBASE_SERVICE_ACCOUNT) {
@@ -20,8 +20,9 @@ if (process.env.FIREBASE_SERVICE_ACCOUNT) {
 const db = admin.firestore();
 
 const MAX_SINGLE_REWARD = 500000;
+const MIN_OFFER_COINS_FOR_CHALLENGE = 20;      // حد أدنى لقيمة العرض ليُحتسب في تحدي الـ 5 عروض
 const AD_REWARD_COINS = 13;
-const AD_COOLDOWN_MS = 4 * 60 * 1000;        // 4 دقائق بتوقيت السيرفر
+const AD_COOLDOWN_MS = 4 * 60 * 1000;          // 4 دقائق بتوقيت السيرفر
 const DAILY_COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24 ساعة للعجلة والبطاقة
 
 // جوائز واحتمالات عجلة الحظ (مجموع الأوزان = 10000)
@@ -72,6 +73,10 @@ function sanitizeDocId(value) {
   return String(value).replace(/[^a-zA-Z0-9_-]/g, '_');
 }
 
+function sha256(value) {
+  return crypto.createHash('sha256').update(String(value).trim().toLowerCase()).digest('hex');
+}
+
 function getTodayUtcKey() {
   const now = new Date();
   const y = now.getUTCFullYear();
@@ -101,15 +106,34 @@ async function verifyFirebaseToken(req, res, next) {
   try {
     const decoded = await admin.auth().verifyIdToken(idToken);
     req.uid = decoded.uid;
-    req.userEmail = decoded.email || 'Unknown';
+    req.userEmail = (decoded.email || '').trim().toLowerCase();
     return next();
   } catch (err) {
     return res.status(401).json({ success: false, error: 'INVALID_TOKEN' });
   }
 }
 
+// التحقق من Firebase App Check (يُفعّل من Render عبر ENFORCE_APP_CHECK=true بعد الإنتاج)
+async function verifyAppCheck(req, res, next) {
+  if (process.env.ENFORCE_APP_CHECK !== 'true') return next();
+  const appCheckToken = req.header('X-Firebase-AppCheck');
+  if (!appCheckToken) {
+    return res.status(401).json({ success: false, error: 'MISSING_APP_CHECK' });
+  }
+  try {
+    await admin.appCheck().verifyToken(appCheckToken);
+    return next();
+  } catch (err) {
+    return res.status(401).json({ success: false, error: 'INVALID_APP_CHECK' });
+  }
+}
+
 app.get('/', (req, res) => {
-  res.send('Game Rewards Secure Server is Running!');
+  res.status(200).send('Game Rewards Secure Server is Running!');
+});
+
+app.get('/health', (req, res) => {
+  res.status(200).send('OK');
 });
 
 // ==========================================
@@ -123,8 +147,12 @@ async function creditUserCoins(uid, amount, network, offerId) {
     throw new Error('Invalid userId or reward amount');
   }
 
+  if (!offerId || String(offerId).trim().length === 0) {
+    throw new Error('Missing transaction/offer ID');
+  }
+
   const safeUid = sanitizeDocId(uid);
-  const safeOfferId = sanitizeDocId(offerId || `tx_${Date.now()}`);
+  const safeOfferId = sanitizeDocId(offerId);
   const txId = `${network}_${safeOfferId}_${safeUid}`;
 
   const txRef = db.collection('completed_offers').doc(txId);
@@ -166,15 +194,17 @@ async function creditUserCoins(uid, amount, network, offerId) {
       uid,
       network,
       coins: coinsToAdd,
-      offerId: String(offerId || 'unknown'),
+      offerId: String(offerId),
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    // زيادة عداد العروض المكتملة تلقائياً لتحدي الـ 5 عروض
-    t.set(challengeRef, {
-      monlix_count: admin.firestore.FieldValue.increment(1),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    }, { merge: true });
+    // احتساب العرض ضمن تحدي الـ 5 عروض فقط إذا كانت قيمته 20 عملة فأكثر
+    if (coinsToAdd >= MIN_OFFER_COINS_FOR_CHALLENGE) {
+      t.set(challengeRef, {
+        monlix_count: admin.firestore.FieldValue.increment(1),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+    }
   });
 }
 
@@ -190,9 +220,16 @@ app.get('/upwall-postback', postbackLimiter, async (req, res) => {
 
     const subId = req.query.subId || req.query.userid;
     const reward = req.query.reward || req.query.user_amount;
-    const offerId = req.query.offerId || req.query.offer_id;
+    const offerId =
+      req.query.transId ||
+      req.query.transaction_id ||
+      req.query.tx_id ||
+      req.query.offerId ||
+      req.query.offer_id;
 
-    if (!subId || !reward) return res.status(400).send('Missing required parameters');
+    if (!subId || !reward || !offerId) {
+      return res.status(400).send('Missing required parameters');
+    }
 
     await creditUserCoins(subId, reward, 'UPWALL', offerId);
     console.log(`✅ UPWALL: User ${subId} credited with ${reward} coins.`);
@@ -215,9 +252,15 @@ app.get('/admantum-postback', postbackLimiter, async (req, res) => {
 
     const uid = req.query.uid || req.query.subId;
     const amount = req.query.amount || req.query.reward || req.query.virtual_currency;
-    const offerId = req.query.offer_id || req.query.of_id || req.query.transaction_id;
+    const offerId =
+      req.query.transaction_id ||
+      req.query.tx_id ||
+      req.query.offer_id ||
+      req.query.of_id;
 
-    if (!uid || !amount) return res.status(400).send('Missing required parameters');
+    if (!uid || !amount || !offerId) {
+      return res.status(400).send('Missing required parameters');
+    }
 
     await creditUserCoins(uid, amount, 'AdMantum', offerId);
     console.log(`✅ AdMantum: User ${uid} credited with ${amount} coins.`);
@@ -229,11 +272,50 @@ app.get('/admantum-postback', postbackLimiter, async (req, res) => {
 });
 
 // ==========================================
-// 2. مسارات التطبيق المحمية (Server-Side)
+// 2. مسار لوحة المتصدرين الآمن (بدون تسريب بيانات خاصة)
+// ==========================================
+let leaderboardCache = null;
+let leaderboardCacheAt = 0;
+const LEADERBOARD_CACHE_TTL_MS = 60 * 1000;
+
+app.get('/api/leaderboard', apiLimiter, verifyFirebaseToken, async (req, res) => {
+  try {
+    const now = Date.now();
+    if (leaderboardCache && (now - leaderboardCacheAt) < LEADERBOARD_CACHE_TTL_MS) {
+      return res.status(200).json({ success: true, leaderboard: leaderboardCache });
+    }
+
+    const snap = await db
+      .collection('users')
+      .where('isBanned', '==', false)
+      .orderBy('coins', 'desc')
+      .limit(20)
+      .get();
+
+    const list = snap.docs.map((doc, idx) => {
+      const data = doc.data() || {};
+      return {
+        rank: idx + 1,
+        username: String(data.username || 'Player').slice(0, 30),
+        coins: Number(data.coins || 0),
+      };
+    });
+
+    leaderboardCache = list;
+    leaderboardCacheAt = now;
+    return res.status(200).json({ success: true, leaderboard: list });
+  } catch (err) {
+    console.error('❌ /api/leaderboard Error:', err);
+    return res.status(500).json({ success: false, error: 'SERVER_ERROR' });
+  }
+});
+
+// ==========================================
+// 3. مسارات التطبيق المحمية (Server-Side)
 // ==========================================
 
 // 🎬 مكافأة الإعلانات (غير محدود • كل 4 دقائق • 13 عملة)
-app.post('/api/claim-ad', apiLimiter, verifyFirebaseToken, async (req, res) => {
+app.post('/api/claim-ad', apiLimiter, verifyAppCheck, verifyFirebaseToken, async (req, res) => {
   try {
     const uid = req.uid;
     const today = getTodayUtcKey();
@@ -288,7 +370,7 @@ app.post('/api/claim-ad', apiLimiter, verifyFirebaseToken, async (req, res) => {
 });
 
 // 🎡 عجلة الحظ اليومية (كل 24 ساعة • اختيار الجائزة على السيرفر)
-app.post('/api/spin-wheel', apiLimiter, verifyFirebaseToken, async (req, res) => {
+app.post('/api/spin-wheel', apiLimiter, verifyAppCheck, verifyFirebaseToken, async (req, res) => {
   try {
     const uid = req.uid;
     const userRef = db.collection('users').doc(uid);
@@ -341,7 +423,7 @@ app.post('/api/spin-wheel', apiLimiter, verifyFirebaseToken, async (req, res) =>
 });
 
 // 🎫 بطاقة الحظ اليومية (كل 24 ساعة • اختيار الجائزة على السيرفر)
-app.post('/api/scratch-card', apiLimiter, verifyFirebaseToken, async (req, res) => {
+app.post('/api/scratch-card', apiLimiter, verifyAppCheck, verifyFirebaseToken, async (req, res) => {
   try {
     const uid = req.uid;
     const userRef = db.collection('users').doc(uid);
@@ -394,7 +476,7 @@ app.post('/api/scratch-card', apiLimiter, verifyFirebaseToken, async (req, res) 
 });
 
 // 🏆 تحديات الألعاب (الدخول اليومي + التقييم + إتمام 5 عروض)
-app.post('/api/claim-challenge', apiLimiter, verifyFirebaseToken, async (req, res) => {
+app.post('/api/claim-challenge', apiLimiter, verifyAppCheck, verifyFirebaseToken, async (req, res) => {
   try {
     const uid = req.uid;
     const type = String(req.body.type || '').trim();
@@ -461,14 +543,20 @@ app.post('/api/claim-challenge', apiLimiter, verifyFirebaseToken, async (req, re
   }
 });
 
-// 🤝 تطبيق كود الإحالة (+100 للمستخدم، +50 لصاحب الكود)
-app.post('/api/apply-referral', apiLimiter, verifyFirebaseToken, async (req, res) => {
+// 🤝 تطبيق كود الإحالة (محمي ضد تكرار حذف الحساب بـ uid + email + deviceId)
+app.post('/api/apply-referral', apiLimiter, verifyAppCheck, verifyFirebaseToken, async (req, res) => {
   try {
     const uid = req.uid;
     const inputCode = String(req.body.code || '').trim().toUpperCase();
-    if (!inputCode) return res.status(400).json({ success: false, error: 'INVALID_CODE' });
+    if (!inputCode || inputCode.length > 32) {
+      return res.status(400).json({ success: false, error: 'INVALID_CODE' });
+    }
 
     const userRef = db.collection('users').doc(uid);
+    const uidClaimRef = db.collection('referral_claims').doc(`uid_${sanitizeDocId(uid)}`);
+    const emailClaimRef = req.userEmail
+      ? db.collection('referral_claims').doc(`email_${sha256(req.userEmail)}`)
+      : null;
 
     await db.runTransaction(async (t) => {
       const userDoc = await t.get(userRef);
@@ -479,12 +567,43 @@ app.post('/api/apply-referral', apiLimiter, verifyFirebaseToken, async (req, res
       if (userData.hasUsedReferral === true) throw { status: 400, message: 'ALREADY_USED' };
       if (userData.referralCode === inputCode) throw { status: 400, message: 'SELF_REFERRAL' };
 
+      const uidClaimDoc = await t.get(uidClaimRef);
+      if (uidClaimDoc.exists) throw { status: 400, message: 'ALREADY_USED' };
+
+      if (emailClaimRef) {
+        const emailClaimDoc = await t.get(emailClaimRef);
+        if (emailClaimDoc.exists) throw { status: 400, message: 'ALREADY_USED' };
+      }
+
+      const rawDeviceId = String(userData.deviceId || '').trim();
+      const deviceClaimRef =
+        rawDeviceId && rawDeviceId !== 'unknown_device'
+          ? db.collection('referral_claims').doc(`dev_${sha256(rawDeviceId)}`)
+          : null;
+
+      if (deviceClaimRef) {
+        const deviceClaimDoc = await t.get(deviceClaimRef);
+        if (deviceClaimDoc.exists) throw { status: 400, message: 'ALREADY_USED' };
+      }
+
       const refQuery = db.collection('users').where('referralCode', '==', inputCode).limit(1);
       const refSnap = await t.get(refQuery);
       if (refSnap.empty) throw { status: 404, message: 'CODE_NOT_FOUND' };
 
       const referrerDoc = refSnap.docs[0];
       if (referrerDoc.id === uid) throw { status: 400, message: 'SELF_REFERRAL' };
+      if (referrerDoc.data()?.isBanned === true) throw { status: 400, message: 'INVALID_CODE' };
+
+      const claimMeta = {
+        uid,
+        referrerUid: referrerDoc.id,
+        code: inputCode,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      };
+
+      t.set(uidClaimRef, claimMeta);
+      if (emailClaimRef) t.set(emailClaimRef, claimMeta);
+      if (deviceClaimRef) t.set(deviceClaimRef, claimMeta);
 
       t.update(userRef, {
         coins: admin.firestore.FieldValue.increment(100),
@@ -509,7 +628,7 @@ app.post('/api/apply-referral', apiLimiter, verifyFirebaseToken, async (req, res
 });
 
 // 💳 سحب الجوائز عبر السيرفر
-app.post('/api/redeem', apiLimiter, verifyFirebaseToken, async (req, res) => {
+app.post('/api/redeem', apiLimiter, verifyAppCheck, verifyFirebaseToken, async (req, res) => {
   try {
     const uid = req.uid;
     const rewardId = String(req.body.rewardId || '').trim();
@@ -517,6 +636,7 @@ app.post('/api/redeem', apiLimiter, verifyFirebaseToken, async (req, res) => {
 
     const reward = REWARDS_CATALOG[rewardId];
     if (!reward) return res.status(400).json({ success: false, error: 'INVALID_REWARD' });
+    if (!accountInfo) return res.status(400).json({ success: false, error: 'MISSING_ACCOUNT_INFO' });
 
     const requestId = `REQ-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
     const userRef = db.collection('users').doc(uid);
@@ -539,7 +659,7 @@ app.post('/api/redeem', apiLimiter, verifyFirebaseToken, async (req, res) => {
 
       t.set(reqRef, {
         userId: uid,
-        userEmail: req.userEmail,
+        userEmail: req.userEmail || 'Unknown',
         rewardId,
         title: reward.title,
         category: reward.category,
