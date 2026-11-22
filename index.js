@@ -21,7 +21,7 @@ const db = admin.firestore();
 
 const MAX_SINGLE_REWARD = 500000;
 const MIN_OFFER_COINS_FOR_CHALLENGE = 20;      // حد أدنى لقيمة العرض ليُحتسب في تحدي الـ 5 عروض
-const AD_REWARD_COINS = 13;
+const AD_REWARD_COINS = 18;
 const AD_COOLDOWN_MS = 4 * 60 * 1000;          // 4 دقائق بتوقيت السيرفر
 const DAILY_COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24 ساعة للعجلة والبطاقة
 
@@ -38,7 +38,7 @@ const REWARDS_CATALOG = {
   google_play_20: { title: 'Google Play $20', cost: 250000, category: 'Google Play', imageUrl: 'assets/images/google_play.jpg' },
   amazon_20:      { title: 'Amazon $20', cost: 250000, category: 'Amazon', imageUrl: 'assets/images/amazon.png' },
   paypal_10:      { title: 'PayPal $10', cost: 130000, category: 'PayPal', imageUrl: 'assets/images/paypal.jpg' },
-  usdt_10:        { title: '10 USDT (TRC20)', cost: 150000, category: 'USDT', imageUrl: 'assets/images/usdt.jpg' },
+  usdt_10:        { title: '10 USDT (ERC20)', cost: 150000, category: 'USDT', imageUrl: 'assets/images/usdt.jpg' },
   ff110:          { title: '110 Free Fire Diamonds', cost: 13000, category: 'Free Fire', imageUrl: 'assets/images/freefire.jpg' },
   pubg60:         { title: '60 PUBG Mobile UC', cost: 13000, category: 'PUBG Mobile', imageUrl: 'assets/images/pubg.jpg' },
   pubg325:        { title: '325 PUBG Mobile UC', cost: 65000, category: 'PUBG Mobile', imageUrl: 'assets/images/pubg.jpg' },
