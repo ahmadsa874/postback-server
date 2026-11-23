@@ -601,14 +601,14 @@ app.post('/api/scratch-card', apiLimiter, verifyAppCheck, verifyFirebaseToken, a
   }
 });
 
-// 🏆 تحديات الألعاب (الدخول اليومي + التقييم + إتمام 5 عروض)
+// 🏆 تحديات الألعاب (الدخول اليومي + إتمام 5 عروض)
 app.post('/api/claim-challenge', apiLimiter, verifyAppCheck, verifyFirebaseToken, async (req, res) => {
   try {
     const uid = req.uid;
     const type = String(req.body.type || '').trim();
     const today = getTodayUtcKey();
 
-    if (!['daily_login', 'rate_app', 'five_offers'].includes(type)) {
+    if (!['daily_login', 'five_offers'].includes(type)) {
       return res.status(400).json({ success: false, error: 'INVALID_CHALLENGE' });
     }
 
@@ -632,13 +632,6 @@ app.post('/api/claim-challenge', apiLimiter, verifyAppCheck, verifyFirebaseToken
         }
         reward = 5;
         updates.last_login_date = today;
-      } else if (type === 'rate_app') {
-        if (chData.rated_app === true) {
-          throw { status: 400, message: 'ALREADY_CLAIMED' };
-        }
-        reward = 30;
-        updates.rated_app = true;
-        updates.ratedAt = admin.firestore.FieldValue.serverTimestamp();
       } else if (type === 'five_offers') {
         if (chData.five_offers_claimed === true) {
           throw { status: 400, message: 'ALREADY_CLAIMED' };
