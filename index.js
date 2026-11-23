@@ -4,8 +4,26 @@ const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 
 const app = express();
+app.disable('x-powered-by');
 app.set('trust proxy', 1);
+
+// ترويسات أمان HTTP قياسية
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  next();
+});
+
 app.use(express.json({ limit: '50kb' }));
+
+// معالجة أخطاء JSON التالف بدون كشف تفاصيل السيرفر
+app.use((err, req, res, next) => {
+  if (err && err.type === 'entity.parse.failed') {
+    return res.status(400).json({ success: false, error: 'INVALID_JSON' });
+  }
+  return next(err);
+});
 
 // تهيئة Firebase Admin
 if (process.env.FIREBASE_SERVICE_ACCOUNT) {
@@ -15,6 +33,7 @@ if (process.env.FIREBASE_SERVICE_ACCOUNT) {
   });
 } else {
   console.error('❌ FIREBASE_SERVICE_ACCOUNT environment variable is missing!');
+  process.exit(1);
 }
 
 const db = admin.firestore();
@@ -23,6 +42,7 @@ const MAX_SINGLE_REWARD = 500000;
 const MIN_OFFER_COINS_FOR_CHALLENGE = 20;      // حد أدنى لقيمة العرض ليُحتسب في تحدي الـ 5 عروض
 const AD_REWARD_COINS = 18;
 const AD_COOLDOWN_MS = 4 * 60 * 1000;          // 4 دقائق بتوقيت السيرفر
+const MAX_DAILY_ADS = 40;                      // حد يومي لحماية حساب AdMob من النقرات المفرطة
 const DAILY_COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24 ساعة للعجلة والبطاقة
 
 // جوائز واحتمالات عجلة الحظ (مجموع الأوزان = 10000)
@@ -35,13 +55,13 @@ const SCRATCH_WEIGHTS = [400, 300, 150, 100, 40, 10];
 
 // كتالوج الجوائز الرسمي على السيرفر (يمنع تزوير الأسعار ومتوافق مع Google Play)
 const REWARDS_CATALOG = {
-  google_play_20: { title: 'Google Play $20', cost: 250000, category: 'Google Play', imageUrl: 'assets/images/google_play.jpg' },
-  amazon_20:      { title: 'Amazon $20', cost: 250000, category: 'Amazon', imageUrl: 'assets/images/amazon.png' },
-  paypal_10:      { title: 'PayPal $10', cost: 130000, category: 'PayPal', imageUrl: 'assets/images/paypal.jpg' },
-  ff110:          { title: '110 Free Fire Diamonds', cost: 13000, category: 'Free Fire', imageUrl: 'assets/images/freefire.jpg' },
-  pubg60:         { title: '60 PUBG Mobile UC', cost: 13000, category: 'PUBG Mobile', imageUrl: 'assets/images/pubg.jpg' },
-  pubg325:        { title: '325 PUBG Mobile UC', cost: 65000, category: 'PUBG Mobile', imageUrl: 'assets/images/pubg.jpg' },
-  pubg660:        { title: '660 PUBG Mobile UC', cost: 130000, category: 'PUBG Mobile', imageUrl: 'assets/images/pubg.jpg' },
+  google_play_20: { title: 'Google Play $20', cost: 250000, category: 'Google Play', imageUrl: 'assets/images/google_play.jpg', requiresEmail: true },
+  amazon_20:      { title: 'Amazon $20', cost: 250000, category: 'Amazon', imageUrl: 'assets/images/amazon.png', requiresEmail: true },
+  paypal_10:      { title: 'PayPal $10', cost: 130000, category: 'PayPal', imageUrl: 'assets/images/paypal.jpg', requiresEmail: true },
+  ff110:          { title: '110 Free Fire Diamonds', cost: 13000, category: 'Free Fire', imageUrl: 'assets/images/freefire.jpg', requiresEmail: false },
+  pubg60:         { title: '60 PUBG Mobile UC', cost: 13000, category: 'PUBG Mobile', imageUrl: 'assets/images/pubg.jpg', requiresEmail: false },
+  pubg325:        { title: '325 PUBG Mobile UC', cost: 65000, category: 'PUBG Mobile', imageUrl: 'assets/images/pubg.jpg', requiresEmail: false },
+  pubg660:        { title: '660 PUBG Mobile UC', cost: 130000, category: 'PUBG Mobile', imageUrl: 'assets/images/pubg.jpg', requiresEmail: false },
 };
 
 const postbackLimiter = rateLimit({
@@ -68,8 +88,22 @@ function isValidSecret(provided, expected) {
   return crypto.timingSafeEqual(a, b);
 }
 
-function sanitizeDocId(value) {
-  return String(value).replace(/[^a-zA-Z0-9_-]/g, '_');
+function getQueryString(value) {
+  if (Array.isArray(value)) return String(value[0] || '').trim();
+  if (value === undefined || value === null) return '';
+  return String(value).trim();
+}
+
+function isValidUid(uid) {
+  return typeof uid === 'string' && /^[a-zA-Z0-9_-]{6,128}$/.test(uid);
+}
+
+function isValidEmail(email) {
+  return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email);
+}
+
+function sanitizeDocId(value, maxLen = 120) {
+  return String(value).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, maxLen);
 }
 
 function sha256(value) {
@@ -84,6 +118,17 @@ function getTodayUtcKey() {
   return `${y}-${m}-${d}`;
 }
 
+function getSecondsUntilUtcMidnight() {
+  const now = new Date();
+  const nextMidnight = Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate() + 1,
+    0, 0, 0
+  );
+  return Math.max(60, Math.ceil((nextMidnight - now.getTime()) / 1000));
+}
+
 function pickWeightedIndex(weights) {
   const total = weights.reduce((a, b) => a + b, 0);
   const r = crypto.randomInt(0, total);
@@ -93,6 +138,15 @@ function pickWeightedIndex(weights) {
     if (r < cumulative) return i;
   }
   return 0;
+}
+
+async function deleteRefsInChunks(docRefs, chunkSize = 400) {
+  for (let i = 0; i < docRefs.length; i += chunkSize) {
+    const batch = db.batch();
+    const slice = docRefs.slice(i, i + chunkSize);
+    slice.forEach((ref) => batch.delete(ref));
+    await batch.commit();
+  }
 }
 
 // التحقق من توكن Firebase Auth
@@ -172,11 +226,11 @@ app.get('/privacy-policy', (req, res) => {
 
     <h2>1. Information We Collect</h2>
     <ul>
-      <li><strong>Account Information:</strong> Email address, username, and unique user ID (UID) created through Firebase Authentication.</li>
-      <li><strong>Device &amp; Anti-Fraud Information:</strong> Device identifier (Device ID), basic security signals (such as VPN, proxy, or root/jailbreak detection), and Google Play Integrity / App Check verification tokens to prevent fraud and multi-account abuse.</li>
+      <li><strong>Account Information:</strong> Email address, username, and unique user ID (UID) created through Firebase Authentication / Google Sign-In.</li>
+      <li><strong>Device, Approximate Location &amp; Anti-Fraud Information:</strong> App-scoped Device ID, approximate IP-based region/location, basic security signals (such as VPN, proxy, or root/jailbreak detection), and Google Play Integrity / App Check verification tokens to prevent fraud and multi-account abuse.</li>
       <li><strong>Activity &amp; Rewards Data:</strong> Virtual coin balance, daily check-ins, rewarded video progress, completed offerwall transactions, referral codes, and leaderboard ranking.</li>
       <li><strong>Redemption &amp; Support Details:</strong> Information you voluntarily submit when redeeming digital rewards (such as game Player IDs or delivery email) or opening in-app support tickets.</li>
-      <li><strong>Advertising Data:</strong> Advertising ID (AAID) and ad interaction diagnostics collected by our advertising and offerwall partners.</li>
+      <li><strong>Advertising &amp; Diagnostics Data:</strong> Advertising ID (AAID), crash logs, and ad interaction diagnostics collected by our advertising and offerwall partners.</li>
     </ul>
 
     <h2>2. How We Use Your Information</h2>
@@ -192,22 +246,25 @@ app.get('/privacy-policy', (req, res) => {
     <ul>
       <li><strong>Google Firebase</strong> (Authentication, Cloud Firestore, App Check): <a href="https://firebase.google.com/support/privacy" target="_blank" rel="noopener">Firebase Privacy Policy</a></li>
       <li><strong>Google AdMob</strong> (Rewarded &amp; Banner Advertising): <a href="https://policies.google.com/privacy" target="_blank" rel="noopener">Google Privacy Policy</a></li>
-      <li><strong>Partner Offerwalls (UPWALL &amp; AdMantum):</strong> Receive your anonymized App User ID to track completed offers and credit your coin balance via secure server-to-server postbacks.</li>
+      <li><strong>Partner Offerwalls (UPWALL &amp; AdMantum):</strong> Receive your anonymized App User ID to track completed offers and credit your virtual coin balance via secure server-to-server postbacks.</li>
     </ul>
 
     <h2>4. Data Security &amp; Retention</h2>
-    <p>All communication between the App and our servers is encrypted via HTTPS/TLS. We retain your account data for as long as your account remains active. Certain hashed anti-fraud records (such as one-way SHA-256 hashes for referral abuse prevention) and completed transaction logs may be retained as needed to protect platform integrity.</p>
+    <p>All communication between the App and our servers is encrypted via HTTPS/TLS. We retain your account data for as long as your account remains active. Certain irreversible hashed anti-fraud records (such as one-way SHA-256 hashes for referral abuse prevention) and completed transaction logs may be retained as needed to protect platform integrity.</p>
 
     <h2>5. Account &amp; Data Deletion</h2>
-    <p>You may permanently delete your account and associated personal data at any time directly inside the App or by following the instructions on our <a href="/delete-account">Account Deletion Page</a>.</p>
+    <p>You may permanently delete your account and associated personal data at any time directly inside the App (Settings &rarr; Delete Account) or by following the instructions on our <a href="/delete-account">Account Deletion Page</a>.</p>
 
-    <h2>6. Children's Privacy</h2>
-    <p>${APP_NAME} is not intended for children under the age of 13 (or the applicable minimum age in your jurisdiction). We do not knowingly collect personal information from children. If you believe a child has provided us with personal data, please contact us immediately so we can delete it.</p>
+    <h2>6. Age Requirement &amp; Children's Privacy</h2>
+    <p>${APP_NAME} is intended for users aged <strong>18 and older</strong> and is not directed to children under the age of 13 (or the applicable minimum age in your jurisdiction). We do not knowingly collect personal information from children. If you believe a child has provided us with personal data, please contact us immediately so we can delete it.</p>
 
-    <h2>7. Changes to This Policy</h2>
+    <h2>7. Disclaimer</h2>
+    <p>${APP_NAME} is an independent loyalty rewards application and is not affiliated with, sponsored by, or endorsed by Google LLC, Apple Inc., Amazon, PayPal, or the publishers of PUBG Mobile or Free Fire. All trademarks belong to their respective owners.</p>
+
+    <h2>8. Changes to This Policy</h2>
     <p>We may update this Privacy Policy from time to time. Any changes will be posted on this page with an updated revision date.</p>
 
-    <h2>8. Contact Us</h2>
+    <h2>9. Contact Us</h2>
     <p>If you have any questions about this Privacy Policy, please contact us at: <a href="mailto:${SUPPORT_EMAIL}">${SUPPORT_EMAIL}</a></p>
   </div>
 </body>
@@ -233,7 +290,7 @@ app.get('/delete-account', (req, res) => {
     <h2>Option 1: Delete Directly Inside the App (Instant)</h2>
     <ol>
       <li>Open the <strong>${APP_NAME}</strong> app and sign in to your account.</li>
-      <li>Go to your <strong>Profile / Settings</strong> screen.</li>
+      <li>Go to the <strong>Settings</strong> tab.</li>
       <li>Tap <strong>Delete Account</strong> and confirm the deletion request.</li>
     </ol>
 
@@ -245,7 +302,7 @@ app.get('/delete-account', (req, res) => {
     <h2>What Data Is Deleted</h2>
     <ul>
       <li>Your Firebase Authentication account (email and login credentials).</li>
-      <li>Your user profile, username, coin balance, notifications, and activity history.</li>
+      <li>Your user profile, username, virtual coin balance, notifications, and activity history.</li>
       <li>In-app support tickets and messages associated with your account.</li>
     </ul>
 
@@ -265,23 +322,25 @@ app.get('/delete-account', (req, res) => {
 // 1. مسارات الـ Postback (UPWALL & AdMantum)
 // ==========================================
 async function creditUserCoins(uid, amount, network, offerId) {
+  const cleanUid = String(uid || '').trim();
   const numericAmount = Number(amount);
   const coinsToAdd = Math.floor(numericAmount);
+  const cleanOfferId = String(offerId || '').trim();
 
-  if (!uid || !Number.isFinite(numericAmount) || coinsToAdd <= 0 || coinsToAdd > MAX_SINGLE_REWARD) {
+  if (!isValidUid(cleanUid) || !Number.isFinite(numericAmount) || coinsToAdd <= 0 || coinsToAdd > MAX_SINGLE_REWARD) {
     throw new Error('Invalid userId or reward amount');
   }
 
-  if (!offerId || String(offerId).trim().length === 0) {
-    throw new Error('Missing transaction/offer ID');
+  if (!cleanOfferId || cleanOfferId.length > 200) {
+    throw new Error('Invalid transaction/offer ID');
   }
 
-  const safeUid = sanitizeDocId(uid);
-  const safeOfferId = sanitizeDocId(offerId);
+  const safeUid = sanitizeDocId(cleanUid, 128);
+  const safeOfferId = sanitizeDocId(cleanOfferId, 120);
   const txId = `${network}_${safeOfferId}_${safeUid}`;
 
   const txRef = db.collection('completed_offers').doc(txId);
-  const userRef = db.collection('users').doc(uid);
+  const userRef = db.collection('users').doc(cleanUid);
   const challengeRef = userRef.collection('activity').doc('challenges');
 
   await db.runTransaction(async (t) => {
@@ -297,7 +356,7 @@ async function creditUserCoins(uid, amount, network, offerId) {
     const userData = userDoc.data() || {};
     if (userData.isBanned === true) throw new Error('User is banned');
 
-    const currentCoins = userData.coins || 0;
+    const currentCoins = Number(userData.coins || 0);
     const currentNotifications = Array.isArray(userData.notifications)
       ? userData.notifications
       : [];
@@ -308,7 +367,7 @@ async function creditUserCoins(uid, amount, network, offerId) {
       notifications: [
         {
           title: '🎉 مكافأة عرض جديدة!',
-          body: `تمت إضافة ${coinsToAdd} عملة ذهبية من جدار عروض ${network}`,
+          body: `تمت إضافة ${coinsToAdd} عملة افتراضية من جدار عروض ${network}`,
           time: 'الآن',
         },
         ...currentNotifications.slice(0, 19),
@@ -316,10 +375,10 @@ async function creditUserCoins(uid, amount, network, offerId) {
     });
 
     t.set(txRef, {
-      uid,
+      uid: cleanUid,
       network,
       coins: coinsToAdd,
-      offerId: String(offerId),
+      offerId: cleanOfferId,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
@@ -336,21 +395,22 @@ async function creditUserCoins(uid, amount, network, offerId) {
 app.get('/upwall-postback', postbackLimiter, async (req, res) => {
   try {
     const expectedPassword = (process.env.UPWALL_POSTBACK_PASSWORD || '').trim();
-    const providedPassword = String(req.query.password || req.query.secret || '').trim();
+    const providedPassword = getQueryString(req.query.password || req.query.secret);
 
     if (!isValidSecret(providedPassword, expectedPassword)) {
       console.warn(`🚫 Unauthorized UPWALL postback attempt from IP: ${req.ip}`);
       return res.status(403).send('Forbidden');
     }
 
-    const subId = req.query.subId || req.query.userid;
-    const reward = req.query.reward || req.query.user_amount;
-    const offerId =
+    const subId = getQueryString(req.query.subId || req.query.userid);
+    const reward = getQueryString(req.query.reward || req.query.user_amount);
+    const offerId = getQueryString(
       req.query.transId ||
       req.query.transaction_id ||
       req.query.tx_id ||
       req.query.offerId ||
-      req.query.offer_id;
+      req.query.offer_id
+    );
 
     if (!subId || !reward || !offerId) {
       return res.status(400).send('Missing required parameters');
@@ -368,20 +428,21 @@ app.get('/upwall-postback', postbackLimiter, async (req, res) => {
 app.get('/admantum-postback', postbackLimiter, async (req, res) => {
   try {
     const expectedSecret = (process.env.ADMANTUM_POSTBACK_SECRET || '').trim();
-    const providedSecret = String(req.query.secret || req.query.password || '').trim();
+    const providedSecret = getQueryString(req.query.secret || req.query.password);
 
     if (!isValidSecret(providedSecret, expectedSecret)) {
       console.warn(`🚫 Unauthorized AdMantum postback attempt from IP: ${req.ip}`);
       return res.status(403).send('Forbidden');
     }
 
-    const uid = req.query.uid || req.query.subId;
-    const amount = req.query.amount || req.query.reward || req.query.virtual_currency;
-    const offerId =
+    const uid = getQueryString(req.query.uid || req.query.subId);
+    const amount = getQueryString(req.query.amount || req.query.reward || req.query.virtual_currency);
+    const offerId = getQueryString(
       req.query.transaction_id ||
       req.query.tx_id ||
       req.query.offer_id ||
-      req.query.of_id;
+      req.query.of_id
+    );
 
     if (!uid || !amount || !offerId) {
       return res.status(400).send('Missing required parameters');
@@ -439,7 +500,7 @@ app.get('/api/leaderboard', apiLimiter, verifyFirebaseToken, async (req, res) =>
 // 3. مسارات التطبيق المحمية (Server-Side)
 // ==========================================
 
-// 🎬 مكافأة الفيديوهات (كل 4 دقائق • 18 عملة)
+// 🎬 مكافأة الفيديوهات (كل 4 دقائق • 18 عملة • حد أقصى يومي لحماية AdMob)
 app.post('/api/claim-ad', apiLimiter, verifyAppCheck, verifyFirebaseToken, async (req, res) => {
   try {
     const uid = req.uid;
@@ -455,6 +516,15 @@ app.post('/api/claim-ad', apiLimiter, verifyAppCheck, verifyFirebaseToken, async
       const adDoc = await t.get(adRef);
       const adData = adDoc.exists ? (adDoc.data() || {}) : {};
 
+      const prevCount = adData.ads_date === today ? Number(adData.ads_watched || 0) : 0;
+      if (prevCount >= MAX_DAILY_ADS) {
+        throw {
+          status: 429,
+          message: 'DAILY_LIMIT_REACHED',
+          remainingSeconds: getSecondsUntilUtcMidnight(),
+        };
+      }
+
       if (adData.last_ad_time && typeof adData.last_ad_time.toMillis === 'function') {
         const elapsedMs = Date.now() - adData.last_ad_time.toMillis();
         if (elapsedMs < AD_COOLDOWN_MS) {
@@ -463,7 +533,6 @@ app.post('/api/claim-ad', apiLimiter, verifyAppCheck, verifyFirebaseToken, async
         }
       }
 
-      const prevCount = adData.ads_date === today ? (adData.ads_watched || 0) : 0;
       const newAdsWatched = prevCount + 1;
 
       t.update(userRef, {
@@ -604,7 +673,8 @@ app.post('/api/scratch-card', apiLimiter, verifyAppCheck, verifyFirebaseToken, a
 app.post('/api/claim-challenge', apiLimiter, verifyAppCheck, verifyFirebaseToken, async (req, res) => {
   try {
     const uid = req.uid;
-    const type = String(req.body.type || '').trim();
+    const body = (req.body && typeof req.body === 'object') ? req.body : {};
+    const type = String(body.type || '').trim();
     const today = getTodayUtcKey();
 
     if (!['daily_login', 'five_offers'].includes(type)) {
@@ -635,7 +705,7 @@ app.post('/api/claim-challenge', apiLimiter, verifyAppCheck, verifyFirebaseToken
         if (chData.five_offers_claimed === true) {
           throw { status: 400, message: 'ALREADY_CLAIMED' };
         }
-        if ((chData.monlix_count || 0) < 5) {
+        if (Number(chData.monlix_count || 0) < 5) {
           throw { status: 400, message: 'NOT_ELIGIBLE' };
         }
         reward = 300;
@@ -665,13 +735,14 @@ app.post('/api/claim-challenge', apiLimiter, verifyAppCheck, verifyFirebaseToken
 app.post('/api/apply-referral', apiLimiter, verifyAppCheck, verifyFirebaseToken, async (req, res) => {
   try {
     const uid = req.uid;
-    const inputCode = String(req.body.code || '').trim().toUpperCase();
-    if (!inputCode || inputCode.length > 32) {
+    const body = (req.body && typeof req.body === 'object') ? req.body : {};
+    const inputCode = String(body.code || '').trim().toUpperCase();
+    if (!inputCode || inputCode.length < 4 || inputCode.length > 32) {
       return res.status(400).json({ success: false, error: 'INVALID_CODE' });
     }
 
     const userRef = db.collection('users').doc(uid);
-    const uidClaimRef = db.collection('referral_claims').doc(`uid_${sanitizeDocId(uid)}`);
+    const uidClaimRef = db.collection('referral_claims').doc(`uid_${sanitizeDocId(uid, 128)}`);
     const emailClaimRef = req.userEmail
       ? db.collection('referral_claims').doc(`email_${sha256(req.userEmail)}`)
       : null;
@@ -749,12 +820,18 @@ app.post('/api/apply-referral', apiLimiter, verifyAppCheck, verifyFirebaseToken,
 app.post('/api/redeem', apiLimiter, verifyAppCheck, verifyFirebaseToken, async (req, res) => {
   try {
     const uid = req.uid;
-    const rewardId = String(req.body.rewardId || '').trim();
-    const accountInfo = String(req.body.accountInfo || '').trim().slice(0, 200);
+    const body = (req.body && typeof req.body === 'object') ? req.body : {};
+    const rewardId = String(body.rewardId || '').trim();
+    const accountInfo = String(body.accountInfo || '').trim().slice(0, 200);
 
     const reward = REWARDS_CATALOG[rewardId];
     if (!reward) return res.status(400).json({ success: false, error: 'INVALID_REWARD' });
-    if (!accountInfo) return res.status(400).json({ success: false, error: 'MISSING_ACCOUNT_INFO' });
+    if (accountInfo.length < 4) {
+      return res.status(400).json({ success: false, error: 'INVALID_ACCOUNT_INFO' });
+    }
+    if (reward.requiresEmail && !isValidEmail(accountInfo)) {
+      return res.status(400).json({ success: false, error: 'INVALID_EMAIL' });
+    }
 
     const requestId = `REQ-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
     const userRef = db.collection('users').doc(uid);
@@ -767,8 +844,10 @@ app.post('/api/redeem', apiLimiter, verifyAppCheck, verifyFirebaseToken, async (
       const userData = userDoc.data() || {};
       if (userData.isBanned === true) throw { status: 403, message: 'USER_BANNED' };
 
-      const serverCoins = userData.coins || 0;
-      if (serverCoins < reward.cost) throw { status: 400, message: 'INSUFFICIENT_COINS' };
+      const serverCoins = Number(userData.coins || 0);
+      if (!Number.isFinite(serverCoins) || serverCoins < reward.cost) {
+        throw { status: 400, message: 'INSUFFICIENT_COINS' };
+      }
 
       t.update(userRef, {
         coins: serverCoins - reward.cost,
@@ -800,8 +879,8 @@ app.post('/api/redeem', apiLimiter, verifyAppCheck, verifyFirebaseToken, async (
   }
 });
 
-// 🗑️ حذف الحساب بالكامل من السيرفر (مطلوب لسياسة Google Play بدون خطأ requires-recent-login)
-app.post('/api/delete-account', apiLimiter, verifyAppCheck, verifyFirebaseToken, async (req, res) => {
+// 🗑️ حذف الحساب بالكامل من السيرفر (متوافق مع سياسة Google Play بدون عرقلة App Check)
+app.post('/api/delete-account', apiLimiter, verifyFirebaseToken, async (req, res) => {
   try {
     const uid = req.uid;
     const userRef = db.collection('users').doc(uid);
@@ -811,27 +890,26 @@ app.post('/api/delete-account', apiLimiter, verifyAppCheck, verifyFirebaseToken,
       return res.status(403).json({ success: false, error: 'USER_BANNED' });
     }
 
-    // 1. حذف المجموعات الفرعية لنشاط المستخدم
+    // 1. حذف المجموعات الفرعية لنشاط المستخدم وملف المستخدم على دفعات آمنة
     const activitySnap = await userRef.collection('activity').get();
-    const batch = db.batch();
-    activitySnap.docs.forEach((doc) => batch.delete(doc.ref));
-    batch.delete(userRef);
-    await batch.commit();
+    const userRefsToDelete = [...activitySnap.docs.map((doc) => doc.ref), userRef];
+    await deleteRefsInChunks(userRefsToDelete);
 
-    // 2. حذف تذاكر الدعم الفني ورسائلها المرتبطة بالمستخدم
+    // 2. حذف تذاكر الدعم الفني ورسائلها المرتبطة بالمستخدم على دفعات آمنة
     const ticketsSnap = await db.collection('support_tickets').where('userId', '==', uid).get();
     for (const ticketDoc of ticketsSnap.docs) {
       const msgsSnap = await ticketDoc.ref.collection('messages').get();
-      const tBatch = db.batch();
-      msgsSnap.docs.forEach((m) => tBatch.delete(m.ref));
-      tBatch.delete(ticketDoc.ref);
-      await tBatch.commit();
+      const ticketRefsToDelete = [...msgsSnap.docs.map((m) => m.ref), ticketDoc.ref];
+      await deleteRefsInChunks(ticketRefsToDelete);
     }
 
     // 3. حذف حساب Firebase Auth نهائياً
-    await admin.auth().deleteUser(uid);
+    try {
+      await admin.auth().deleteUser(uid);
+    } catch (authErr) {
+      if (authErr?.code !== 'auth/user-not-found') throw authErr;
+    }
 
-    // تحديث كاش المتصدرين
     leaderboardCache = null;
 
     console.log(`🗑️ Account permanently deleted: ${uid}`);
