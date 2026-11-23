@@ -139,7 +139,7 @@ app.get('/health', (req, res) => {
 // ==========================================
 // 0. صفحات سياسة الخصوصية وحذف الحساب (Google Play)
 // ==========================================
-const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || 'support@gamesrewards.top';
+const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || 'support0gamerewards.top@gmail.com';
 const APP_NAME = 'Game Rewards';
 
 const LEGAL_PAGE_STYLE = `
