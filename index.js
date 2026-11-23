@@ -33,12 +33,11 @@ const WHEEL_WEIGHTS = [5000, 3500, 1200, 150, 80, 50, 18, 2];
 const SCRATCH_PRIZES = [5, 10, 20, 50, 100, 250];
 const SCRATCH_WEIGHTS = [400, 300, 150, 100, 40, 10];
 
-// كتالوج الجوائز الرسمي على السيرفر (يمنع تزوير الأسعار)
+// كتالوج الجوائز الرسمي على السيرفر (يمنع تزوير الأسعار ومتوافق مع Google Play)
 const REWARDS_CATALOG = {
   google_play_20: { title: 'Google Play $20', cost: 250000, category: 'Google Play', imageUrl: 'assets/images/google_play.jpg' },
   amazon_20:      { title: 'Amazon $20', cost: 250000, category: 'Amazon', imageUrl: 'assets/images/amazon.png' },
   paypal_10:      { title: 'PayPal $10', cost: 130000, category: 'PayPal', imageUrl: 'assets/images/paypal.jpg' },
-  usdt_10:        { title: '10 USDT (ERC20)', cost: 150000, category: 'USDT', imageUrl: 'assets/images/usdt.jpg' },
   ff110:          { title: '110 Free Fire Diamonds', cost: 13000, category: 'Free Fire', imageUrl: 'assets/images/freefire.jpg' },
   pubg60:         { title: '60 PUBG Mobile UC', cost: 13000, category: 'PUBG Mobile', imageUrl: 'assets/images/pubg.jpg' },
   pubg325:        { title: '325 PUBG Mobile UC', cost: 65000, category: 'PUBG Mobile', imageUrl: 'assets/images/pubg.jpg' },
@@ -175,16 +174,16 @@ app.get('/privacy-policy', (req, res) => {
     <ul>
       <li><strong>Account Information:</strong> Email address, username, and unique user ID (UID) created through Firebase Authentication.</li>
       <li><strong>Device &amp; Anti-Fraud Information:</strong> Device identifier (Device ID), basic security signals (such as VPN, proxy, or root/jailbreak detection), and Google Play Integrity / App Check verification tokens to prevent fraud and multi-account abuse.</li>
-      <li><strong>Activity &amp; Rewards Data:</strong> Virtual coin balance, daily check-ins, rewarded ad progress, completed offerwall transactions, referral codes, and leaderboard ranking.</li>
-      <li><strong>Redemption &amp; Support Details:</strong> Information you voluntarily submit when redeeming rewards (such as game Player IDs, PayPal email, or USDT wallet address) or opening in-app support tickets.</li>
+      <li><strong>Activity &amp; Rewards Data:</strong> Virtual coin balance, daily check-ins, rewarded video progress, completed offerwall transactions, referral codes, and leaderboard ranking.</li>
+      <li><strong>Redemption &amp; Support Details:</strong> Information you voluntarily submit when redeeming digital rewards (such as game Player IDs or delivery email) or opening in-app support tickets.</li>
       <li><strong>Advertising Data:</strong> Advertising ID (AAID) and ad interaction diagnostics collected by our advertising and offerwall partners.</li>
     </ul>
 
     <h2>2. How We Use Your Information</h2>
     <ul>
       <li>To create and maintain your account and sync your virtual coin balance.</li>
-      <li>To credit rewards accurately from rewarded ads, daily activities, referrals, and partner offerwalls.</li>
-      <li>To process reward redemption requests and respond to customer support inquiries.</li>
+      <li>To credit virtual coins accurately from rewarded videos, daily activities, referrals, and partner offerwalls.</li>
+      <li>To process digital reward redemption requests and respond to customer support inquiries.</li>
       <li>To detect, prevent, and block fraudulent activity, automated bots, and policy violations.</li>
     </ul>
 
@@ -247,7 +246,7 @@ app.get('/delete-account', (req, res) => {
     <ul>
       <li>Your Firebase Authentication account (email and login credentials).</li>
       <li>Your user profile, username, coin balance, notifications, and activity history.</li>
-      <li>Pending in-app support tickets associated with your account.</li>
+      <li>In-app support tickets and messages associated with your account.</li>
     </ul>
 
     <h2>What Data May Be Retained</h2>
@@ -440,7 +439,7 @@ app.get('/api/leaderboard', apiLimiter, verifyFirebaseToken, async (req, res) =>
 // 3. مسارات التطبيق المحمية (Server-Side)
 // ==========================================
 
-// 🎬 مكافأة الإعلانات (غير محدود • كل 4 دقائق • 18 عملة)
+// 🎬 مكافأة الفيديوهات (كل 4 دقائق • 18 عملة)
 app.post('/api/claim-ad', apiLimiter, verifyAppCheck, verifyFirebaseToken, async (req, res) => {
   try {
     const uid = req.uid;
@@ -797,6 +796,48 @@ app.post('/api/redeem', apiLimiter, verifyAppCheck, verifyFirebaseToken, async (
       return res.status(err.status).json({ success: false, error: err.message });
     }
     console.error('❌ /api/redeem Error:', err);
+    return res.status(500).json({ success: false, error: 'SERVER_ERROR' });
+  }
+});
+
+// 🗑️ حذف الحساب بالكامل من السيرفر (مطلوب لسياسة Google Play بدون خطأ requires-recent-login)
+app.post('/api/delete-account', apiLimiter, verifyAppCheck, verifyFirebaseToken, async (req, res) => {
+  try {
+    const uid = req.uid;
+    const userRef = db.collection('users').doc(uid);
+    const userDoc = await userRef.get();
+
+    if (userDoc.exists && userDoc.data()?.isBanned === true) {
+      return res.status(403).json({ success: false, error: 'USER_BANNED' });
+    }
+
+    // 1. حذف المجموعات الفرعية لنشاط المستخدم
+    const activitySnap = await userRef.collection('activity').get();
+    const batch = db.batch();
+    activitySnap.docs.forEach((doc) => batch.delete(doc.ref));
+    batch.delete(userRef);
+    await batch.commit();
+
+    // 2. حذف تذاكر الدعم الفني ورسائلها المرتبطة بالمستخدم
+    const ticketsSnap = await db.collection('support_tickets').where('userId', '==', uid).get();
+    for (const ticketDoc of ticketsSnap.docs) {
+      const msgsSnap = await ticketDoc.ref.collection('messages').get();
+      const tBatch = db.batch();
+      msgsSnap.docs.forEach((m) => tBatch.delete(m.ref));
+      tBatch.delete(ticketDoc.ref);
+      await tBatch.commit();
+    }
+
+    // 3. حذف حساب Firebase Auth نهائياً
+    await admin.auth().deleteUser(uid);
+
+    // تحديث كاش المتصدرين
+    leaderboardCache = null;
+
+    console.log(`🗑️ Account permanently deleted: ${uid}`);
+    return res.status(200).json({ success: true });
+  } catch (err) {
+    console.error('❌ /api/delete-account Error:', err);
     return res.status(500).json({ success: false, error: 'SERVER_ERROR' });
   }
 });
