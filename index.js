@@ -53,20 +53,20 @@ const WHEEL_WEIGHTS = [5000, 3500, 1200, 150, 80, 50, 18, 2];
 const SCRATCH_PRIZES = [5, 10, 20, 50, 100, 250];
 const SCRATCH_WEIGHTS = [400, 300, 150, 100, 40, 10];
 
-// كتالوج الجوائز الرسمي على السيرفر (يمنع تزوير الأسعار ومتوافق مع Google Play)
-const REWARDS_CATALOG = {
-  google_play_20: { title: 'Google Play $20', cost: 250000, category: 'Google Play', imageUrl: 'assets/images/google_play.jpg', requiresEmail: true },
-  amazon_20:      { title: 'Amazon $20', cost: 250000, category: 'Amazon', imageUrl: 'assets/images/amazon.png', requiresEmail: true },
-  paypal_10:      { title: 'PayPal $10', cost: 130000, category: 'PayPal', imageUrl: 'assets/images/paypal.jpg', requiresEmail: true },
-  ff110:          { title: '110 Free Fire Diamonds', cost: 13000, category: 'Free Fire', imageUrl: 'assets/images/freefire.jpg', requiresEmail: false },
-  pubg60:         { title: '60 PUBG Mobile UC', cost: 13000, category: 'PUBG Mobile', imageUrl: 'assets/images/pubg.jpg', requiresEmail: false },
-  pubg325:        { title: '325 PUBG Mobile UC', cost: 65000, category: 'PUBG Mobile', imageUrl: 'assets/images/pubg.jpg', requiresEmail: false },
-  pubg660:        { title: '660 PUBG Mobile UC', cost: 130000, category: 'PUBG Mobile', imageUrl: 'assets/images/pubg.jpg', requiresEmail: false },
-};
+// كتالوج الجوائز الرسمي على السيرفر (مجمّد ومعزول لمنع تزوير الأسعار أو Prototype Lookup)
+const REWARDS_CATALOG = Object.freeze({
+  google_play_20: Object.freeze({ title: 'Google Play $20', cost: 250000, category: 'Google Play', imageUrl: 'assets/images/google_play.jpg', requiresEmail: true }),
+  amazon_20:      Object.freeze({ title: 'Amazon $20', cost: 250000, category: 'Amazon', imageUrl: 'assets/images/amazon.png', requiresEmail: true }),
+  paypal_10:      Object.freeze({ title: 'PayPal $10', cost: 130000, category: 'PayPal', imageUrl: 'assets/images/paypal.jpg', requiresEmail: true }),
+  ff110:          Object.freeze({ title: '110 Free Fire Diamonds', cost: 13000, category: 'Free Fire', imageUrl: 'assets/images/freefire.jpg', requiresEmail: false }),
+  pubg60:         Object.freeze({ title: '60 PUBG Mobile UC', cost: 13000, category: 'PUBG Mobile', imageUrl: 'assets/images/pubg.jpg', requiresEmail: false }),
+  pubg325:        Object.freeze({ title: '325 PUBG Mobile UC', cost: 65000, category: 'PUBG Mobile', imageUrl: 'assets/images/pubg.jpg', requiresEmail: false }),
+  pubg660:        Object.freeze({ title: '660 PUBG Mobile UC', cost: 130000, category: 'PUBG Mobile', imageUrl: 'assets/images/pubg.jpg', requiresEmail: false }),
+});
 
 const postbackLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 60,
+  max: 120,
   standardHeaders: true,
   legacyHeaders: false,
   message: 'Too many requests',
@@ -86,6 +86,12 @@ function isValidSecret(provided, expected) {
   const b = Buffer.from(String(expected));
   if (a.length !== b.length) return false;
   return crypto.timingSafeEqual(a, b);
+}
+
+function getSafeBody(req) {
+  return req.body && typeof req.body === 'object' && !Array.isArray(req.body)
+    ? req.body
+    : {};
 }
 
 function getQueryString(value) {
@@ -149,7 +155,7 @@ async function deleteRefsInChunks(docRefs, chunkSize = 400) {
   }
 }
 
-// التحقق من توكن Firebase Auth
+// التحقق الصارم من توكن Firebase Auth (يرفض التوكنات الملغاة أو المحذوفة فوراً)
 async function verifyFirebaseToken(req, res, next) {
   const authHeader = req.headers.authorization || '';
   if (!authHeader.startsWith('Bearer ')) {
@@ -157,7 +163,7 @@ async function verifyFirebaseToken(req, res, next) {
   }
   const idToken = authHeader.slice(7).trim();
   try {
-    const decoded = await admin.auth().verifyIdToken(idToken);
+    const decoded = await admin.auth().verifyIdToken(idToken, true);
     req.uid = decoded.uid;
     req.userEmail = (decoded.email || '').trim().toLowerCase();
     return next();
@@ -328,11 +334,15 @@ async function creditUserCoins(uid, amount, network, offerId) {
   const cleanOfferId = String(offerId || '').trim();
 
   if (!isValidUid(cleanUid) || !Number.isFinite(numericAmount) || coinsToAdd <= 0 || coinsToAdd > MAX_SINGLE_REWARD) {
-    throw new Error('Invalid userId or reward amount');
+    const err = new Error('Invalid userId or reward amount');
+    err.statusCode = 400;
+    throw err;
   }
 
   if (!cleanOfferId || cleanOfferId.length > 200) {
-    throw new Error('Invalid transaction/offer ID');
+    const err = new Error('Invalid transaction/offer ID');
+    err.statusCode = 400;
+    throw err;
   }
 
   const safeUid = sanitizeDocId(cleanUid, 128);
@@ -351,10 +361,18 @@ async function creditUserCoins(uid, amount, network, offerId) {
     }
 
     const userDoc = await t.get(userRef);
-    if (!userDoc.exists) throw new Error('User not found');
+    if (!userDoc.exists) {
+      const err = new Error('User not found');
+      err.statusCode = 400;
+      throw err;
+    }
 
     const userData = userDoc.data() || {};
-    if (userData.isBanned === true) throw new Error('User is banned');
+    if (userData.isBanned === true) {
+      const err = new Error('User is banned');
+      err.statusCode = 400;
+      throw err;
+    }
 
     const currentCoins = Number(userData.coins || 0);
     const currentNotifications = Array.isArray(userData.notifications)
@@ -421,7 +439,8 @@ app.get('/upwall-postback', postbackLimiter, async (req, res) => {
     return res.status(200).send('1');
   } catch (error) {
     console.error('❌ UPWALL Postback Error:', error.message);
-    return res.status(500).send('0');
+    const code = error.statusCode || 500;
+    return res.status(code).send('0');
   }
 });
 
@@ -453,7 +472,8 @@ app.get('/admantum-postback', postbackLimiter, async (req, res) => {
     return res.status(200).send('OK');
   } catch (error) {
     console.error('❌ AdMantum Postback Error:', error.message);
-    return res.status(500).send('ERROR');
+    const code = error.statusCode || 500;
+    return res.status(code).send('ERROR');
   }
 });
 
@@ -491,7 +511,11 @@ app.get('/api/leaderboard', apiLimiter, verifyFirebaseToken, async (req, res) =>
     leaderboardCacheAt = now;
     return res.status(200).json({ success: true, leaderboard: list });
   } catch (err) {
-    console.error('❌ /api/leaderboard Error:', err);
+    if (err && err.code === 9) {
+      console.error('❌ Firestore Composite Index missing for /api/leaderboard (isBanned ASC, coins DESC). Create it via Firebase Console link in error:', err.message);
+    } else {
+      console.error('❌ /api/leaderboard Error:', err);
+    }
     return res.status(500).json({ success: false, error: 'SERVER_ERROR' });
   }
 });
@@ -673,7 +697,7 @@ app.post('/api/scratch-card', apiLimiter, verifyAppCheck, verifyFirebaseToken, a
 app.post('/api/claim-challenge', apiLimiter, verifyAppCheck, verifyFirebaseToken, async (req, res) => {
   try {
     const uid = req.uid;
-    const body = (req.body && typeof req.body === 'object') ? req.body : {};
+    const body = getSafeBody(req);
     const type = String(body.type || '').trim();
     const today = getTodayUtcKey();
 
@@ -735,7 +759,7 @@ app.post('/api/claim-challenge', apiLimiter, verifyAppCheck, verifyFirebaseToken
 app.post('/api/apply-referral', apiLimiter, verifyAppCheck, verifyFirebaseToken, async (req, res) => {
   try {
     const uid = req.uid;
-    const body = (req.body && typeof req.body === 'object') ? req.body : {};
+    const body = getSafeBody(req);
     const inputCode = String(body.code || '').trim().toUpperCase();
     if (!inputCode || inputCode.length < 4 || inputCode.length > 32) {
       return res.status(400).json({ success: false, error: 'INVALID_CODE' });
@@ -820,12 +844,15 @@ app.post('/api/apply-referral', apiLimiter, verifyAppCheck, verifyFirebaseToken,
 app.post('/api/redeem', apiLimiter, verifyAppCheck, verifyFirebaseToken, async (req, res) => {
   try {
     const uid = req.uid;
-    const body = (req.body && typeof req.body === 'object') ? req.body : {};
+    const body = getSafeBody(req);
     const rewardId = String(body.rewardId || '').trim();
     const accountInfo = String(body.accountInfo || '').trim().slice(0, 200);
 
+    if (!Object.prototype.hasOwnProperty.call(REWARDS_CATALOG, rewardId)) {
+      return res.status(400).json({ success: false, error: 'INVALID_REWARD' });
+    }
     const reward = REWARDS_CATALOG[rewardId];
-    if (!reward) return res.status(400).json({ success: false, error: 'INVALID_REWARD' });
+
     if (accountInfo.length < 4) {
       return res.status(400).json({ success: false, error: 'INVALID_ACCOUNT_INFO' });
     }
@@ -918,6 +945,12 @@ app.post('/api/delete-account', apiLimiter, verifyFirebaseToken, async (req, res
     console.error('❌ /api/delete-account Error:', err);
     return res.status(500).json({ success: false, error: 'SERVER_ERROR' });
   }
+});
+
+// معالج أخطاء عام لمنع تسريب أي stack trace من السيرفر
+app.use((err, req, res, next) => {
+  console.error('❌ Unhandled Server Error:', err);
+  return res.status(500).json({ success: false, error: 'SERVER_ERROR' });
 });
 
 const PORT = process.env.PORT || 3000;
