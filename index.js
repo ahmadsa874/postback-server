@@ -137,6 +137,132 @@ app.get('/health', (req, res) => {
 });
 
 // ==========================================
+// 0. صفحات سياسة الخصوصية وحذف الحساب (Google Play)
+// ==========================================
+const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || 'support@gamesrewards.top';
+const APP_NAME = 'Game Rewards';
+
+const LEGAL_PAGE_STYLE = `
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; background: #f8f9fb; color: #1f2937; margin: 0; padding: 24px 16px; line-height: 1.7; }
+  .card { max-width: 820px; margin: 0 auto; background: #ffffff; border-radius: 14px; padding: 32px; box-shadow: 0 4px 20px rgba(0,0,0,0.06); }
+  h1 { margin-top: 0; color: #111827; font-size: 26px; border-bottom: 2px solid #d4af37; padding-bottom: 12px; }
+  h2 { color: #111827; font-size: 19px; margin-top: 28px; }
+  p, li { color: #374151; font-size: 15px; }
+  ul, ol { padding-left: 22px; }
+  a { color: #b45309; text-decoration: none; font-weight: 600; }
+  a:hover { text-decoration: underline; }
+  .meta { color: #6b7280; font-size: 14px; margin-bottom: 20px; }
+  .box { background: #fffbeb; border-left: 4px solid #d4af37; padding: 14px 18px; border-radius: 6px; margin: 18px 0; }
+`;
+
+app.get('/privacy-policy', (req, res) => {
+  res.status(200).type('html').send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Privacy Policy - ${APP_NAME}</title>
+  <style>${LEGAL_PAGE_STYLE}</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Privacy Policy — ${APP_NAME}</h1>
+    <p class="meta">Last updated: November 2026 | Package ID: com.gamerewards.app</p>
+
+    <p>This Privacy Policy explains how <strong>${APP_NAME}</strong> ("we", "our", or "the App") collects, uses, and protects your information when you use our mobile application.</p>
+
+    <h2>1. Information We Collect</h2>
+    <ul>
+      <li><strong>Account Information:</strong> Email address, username, and unique user ID (UID) created through Firebase Authentication.</li>
+      <li><strong>Device &amp; Anti-Fraud Information:</strong> Device identifier (Device ID), basic security signals (such as VPN, proxy, or root/jailbreak detection), and Google Play Integrity / App Check verification tokens to prevent fraud and multi-account abuse.</li>
+      <li><strong>Activity &amp; Rewards Data:</strong> Virtual coin balance, daily check-ins, rewarded ad progress, completed offerwall transactions, referral codes, and leaderboard ranking.</li>
+      <li><strong>Redemption &amp; Support Details:</strong> Information you voluntarily submit when redeeming rewards (such as game Player IDs, PayPal email, or USDT wallet address) or opening in-app support tickets.</li>
+      <li><strong>Advertising Data:</strong> Advertising ID (AAID) and ad interaction diagnostics collected by our advertising and offerwall partners.</li>
+    </ul>
+
+    <h2>2. How We Use Your Information</h2>
+    <ul>
+      <li>To create and maintain your account and sync your virtual coin balance.</li>
+      <li>To credit rewards accurately from rewarded ads, daily activities, referrals, and partner offerwalls.</li>
+      <li>To process reward redemption requests and respond to customer support inquiries.</li>
+      <li>To detect, prevent, and block fraudulent activity, automated bots, and policy violations.</li>
+    </ul>
+
+    <h2>3. Third-Party Services</h2>
+    <p>The App integrates trusted third-party services that may collect information in accordance with their own privacy policies:</p>
+    <ul>
+      <li><strong>Google Firebase</strong> (Authentication, Cloud Firestore, App Check): <a href="https://firebase.google.com/support/privacy" target="_blank" rel="noopener">Firebase Privacy Policy</a></li>
+      <li><strong>Google AdMob</strong> (Rewarded &amp; Banner Advertising): <a href="https://policies.google.com/privacy" target="_blank" rel="noopener">Google Privacy Policy</a></li>
+      <li><strong>Partner Offerwalls (UPWALL &amp; AdMantum):</strong> Receive your anonymized App User ID to track completed offers and credit your coin balance via secure server-to-server postbacks.</li>
+    </ul>
+
+    <h2>4. Data Security &amp; Retention</h2>
+    <p>All communication between the App and our servers is encrypted via HTTPS/TLS. We retain your account data for as long as your account remains active. Certain hashed anti-fraud records (such as one-way SHA-256 hashes for referral abuse prevention) and completed transaction logs may be retained as needed to protect platform integrity.</p>
+
+    <h2>5. Account &amp; Data Deletion</h2>
+    <p>You may permanently delete your account and associated personal data at any time directly inside the App or by following the instructions on our <a href="/delete-account">Account Deletion Page</a>.</p>
+
+    <h2>6. Children's Privacy</h2>
+    <p>${APP_NAME} is not intended for children under the age of 13 (or the applicable minimum age in your jurisdiction). We do not knowingly collect personal information from children. If you believe a child has provided us with personal data, please contact us immediately so we can delete it.</p>
+
+    <h2>7. Changes to This Policy</h2>
+    <p>We may update this Privacy Policy from time to time. Any changes will be posted on this page with an updated revision date.</p>
+
+    <h2>8. Contact Us</h2>
+    <p>If you have any questions about this Privacy Policy, please contact us at: <a href="mailto:${SUPPORT_EMAIL}">${SUPPORT_EMAIL}</a></p>
+  </div>
+</body>
+</html>`);
+});
+
+app.get('/delete-account', (req, res) => {
+  res.status(200).type('html').send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Delete Account - ${APP_NAME}</title>
+  <style>${LEGAL_PAGE_STYLE}</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Account &amp; Data Deletion — ${APP_NAME}</h1>
+    <p class="meta">App: ${APP_NAME} (com.gamerewards.app)</p>
+
+    <p>Users of <strong>${APP_NAME}</strong> can request permanent deletion of their account and associated personal data at any time using either method below:</p>
+
+    <h2>Option 1: Delete Directly Inside the App (Instant)</h2>
+    <ol>
+      <li>Open the <strong>${APP_NAME}</strong> app and sign in to your account.</li>
+      <li>Go to your <strong>Profile / Settings</strong> screen.</li>
+      <li>Tap <strong>Delete Account</strong> and confirm the deletion request.</li>
+    </ol>
+
+    <h2>Option 2: Request Deletion via Email</h2>
+    <div class="box">
+      If you cannot access the app, send an email from your registered email address to <a href="mailto:${SUPPORT_EMAIL}">${SUPPORT_EMAIL}</a> with the subject line <strong>"Account Deletion Request - ${APP_NAME}"</strong>. We will verify ownership and process your deletion within <strong>7 business days</strong>.
+    </div>
+
+    <h2>What Data Is Deleted</h2>
+    <ul>
+      <li>Your Firebase Authentication account (email and login credentials).</li>
+      <li>Your user profile, username, coin balance, notifications, and activity history.</li>
+      <li>Pending in-app support tickets associated with your account.</li>
+    </ul>
+
+    <h2>What Data May Be Retained</h2>
+    <ul>
+      <li>Irreversible anonymized SHA-256 hashes used strictly to prevent referral and bonus abuse.</li>
+      <li>Completed reward redemption transaction logs required for accounting and anti-fraud auditing (retained for up to 180 days, then purged).</li>
+    </ul>
+
+    <p>For assistance or questions, contact <a href="mailto:${SUPPORT_EMAIL}">${SUPPORT_EMAIL}</a> or view our <a href="/privacy-policy">Privacy Policy</a>.</p>
+  </div>
+</body>
+</html>`);
+});
+
+// ==========================================
 // 1. مسارات الـ Postback (UPWALL & AdMantum)
 // ==========================================
 async function creditUserCoins(uid, amount, network, offerId) {
@@ -314,7 +440,7 @@ app.get('/api/leaderboard', apiLimiter, verifyFirebaseToken, async (req, res) =>
 // 3. مسارات التطبيق المحمية (Server-Side)
 // ==========================================
 
-// 🎬 مكافأة الإعلانات (غير محدود • كل 4 دقائق • 13 عملة)
+// 🎬 مكافأة الإعلانات (غير محدود • كل 4 دقائق • 18 عملة)
 app.post('/api/claim-ad', apiLimiter, verifyAppCheck, verifyFirebaseToken, async (req, res) => {
   try {
     const uid = req.uid;
