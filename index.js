@@ -113,6 +113,18 @@ function getParam(req, ...keys) {
   return '';
 }
 
+function getNonMacroParam(req, ...keys) {
+  const query = req.query || {};
+  const body = getSafeBody(req);
+  for (const key of keys) {
+    const fromQuery = getQueryString(query[key]);
+    if (fromQuery && !/^\{[a-zA-Z0-9_]+\}$/.test(fromQuery)) return fromQuery;
+    const fromBody = getQueryString(body[key]);
+    if (fromBody && !/^\{[a-zA-Z0-9_]+\}$/.test(fromBody)) return fromBody;
+  }
+  return '';
+}
+
 function getClientIp(req) {
   const raw = String(req.ip || '').trim();
   if (!raw) return 'unknown';
@@ -121,7 +133,15 @@ function getClientIp(req) {
 
 function sanitizeUserIp(rawIp) {
   const cleaned = String(rawIp || '').trim().replace(/^::ffff:/, '');
-  if (!cleaned || cleaned.includes('{') || cleaned.length > 64) return null;
+  if (
+    !cleaned ||
+    cleaned === '0.0.0.0' ||
+    cleaned === '::' ||
+    cleaned.includes('{') ||
+    cleaned.length > 64
+  ) {
+    return null;
+  }
   if (!/^[0-9a-fA-F.:]+$/.test(cleaned)) return null;
   return cleaned;
 }
@@ -471,15 +491,21 @@ app.get('/delete-account', (req, res) => {
 function isReversalPostback(req, numericAmount) {
   if (numericAmount < 0) return true;
 
+  const payoutRaw = getNonMacroParam(req, 'payout', 'usd_payout');
+  if (payoutRaw !== '') {
+    const payoutNum = Number(payoutRaw);
+    if (Number.isFinite(payoutNum) && payoutNum < 0) return true;
+  }
+
   const reversalValues = new Set([
     '0', '2', '-1',
     'reversed', 'reversal', 'chargeback',
     'rejected', 'cancelled', 'canceled', 'declined', 'fraud', 'deduct',
   ]);
 
-  const statusVal = getParam(req, 'status', 'event_status').toLowerCase();
-  const typeVal = getParam(req, 'type', 'action', 'event_type').toLowerCase();
-  const cbFlag = getParam(req, 'chargeback', 'is_reversal').toLowerCase();
+  const statusVal = getNonMacroParam(req, 'status', 'event_status').toLowerCase();
+  const typeVal = getNonMacroParam(req, 'type', 'action', 'event_type').toLowerCase();
+  const cbFlag = getNonMacroParam(req, 'chargeback', 'is_reversal').toLowerCase();
 
   if (statusVal && reversalValues.has(statusVal)) return true;
   if (typeVal && reversalValues.has(typeVal)) return true;
@@ -727,10 +753,10 @@ async function handleUpwallPostback(req, res) {
       return res.status(403).send('Forbidden');
     }
 
-    const subId = getParam(req, 'subId', 'userid', 'uid');
-    const reward = getParam(req, 'reward', 'user_amount', 'amount');
-    const offerId = getParam(req, 'transId', 'transaction_id', 'tx_id', 'offerId', 'offer_id');
-    const userOfferIp = getParam(req, 'ip', 'user_ip', 'userIp');
+    const subId = getNonMacroParam(req, 'subId', 'userid', 'uid');
+    const reward = getNonMacroParam(req, 'reward', 'user_amount', 'amount');
+    const offerId = getNonMacroParam(req, 'transId', 'transactionID', 'transaction_id', 'tx_id', 'offerId', 'offer_id');
+    const userOfferIp = getNonMacroParam(req, 'ip', 'ip_address', 'user_ip', 'userIp');
 
     if (!subId || !reward || !offerId) {
       return res.status(400).send('Missing required parameters');
@@ -770,10 +796,10 @@ async function handleAdmantumPostback(req, res) {
       return res.status(403).send('Forbidden');
     }
 
-    const uid = getParam(req, 'uid', 'user_id', 'subId', 'subid');
-    const amount = getParam(req, 'amount', 'virtual_currency', 'reward');
-    const offerId = getParam(req, 'transaction_id', 'tx_id', 'offer_id', 'of_id');
-    const userOfferIp = getParam(req, 'ip', 'user_ip');
+    const uid = getNonMacroParam(req, 'uid', 'user_id', 'subId', 'subid');
+    const amount = getNonMacroParam(req, 'amount', 'virtual_currency', 'reward');
+    const offerId = getNonMacroParam(req, 'transaction_id', 'tx_id', 'offer_id', 'of_id');
+    const userOfferIp = getNonMacroParam(req, 'ip', 'ip_address', 'user_ip');
 
     if (!uid || !amount || !offerId) {
       return res.status(400).send('Missing required parameters');
