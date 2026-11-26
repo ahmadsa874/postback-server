@@ -16,11 +16,12 @@ app.use((req, res, next) => {
 });
 
 app.use(express.json({ limit: '50kb' }));
+app.use(express.urlencoded({ extended: false, limit: '50kb' }));
 
-// معالجة أخطاء JSON التالف بدون كشف تفاصيل السيرفر
+// معالجة أخطاء Body/JSON التالف بدون كشف تفاصيل السيرفر
 app.use((err, req, res, next) => {
-  if (err && err.type === 'entity.parse.failed') {
-    return res.status(400).json({ success: false, error: 'INVALID_JSON' });
+  if (err && (err.type === 'entity.parse.failed' || err.type === 'entity.too.large')) {
+    return res.status(400).json({ success: false, error: 'INVALID_REQUEST_BODY' });
   }
   return next(err);
 });
@@ -66,7 +67,7 @@ const REWARDS_CATALOG = Object.freeze({
 
 const postbackLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 120,
+  max: 240,
   standardHeaders: true,
   legacyHeaders: false,
   message: 'Too many requests',
@@ -80,11 +81,11 @@ const apiLimiter = rateLimit({
   message: { success: false, error: 'TOO_MANY_REQUESTS' },
 });
 
+// مقارنة آمنة زمنياً بدون تسريب طول كلمة السر
 function isValidSecret(provided, expected) {
   if (!provided || !expected) return false;
-  const a = Buffer.from(String(provided));
-  const b = Buffer.from(String(expected));
-  if (a.length !== b.length) return false;
+  const a = crypto.createHash('sha256').update(String(provided)).digest();
+  const b = crypto.createHash('sha256').update(String(expected)).digest();
   return crypto.timingSafeEqual(a, b);
 }
 
@@ -100,10 +101,29 @@ function getQueryString(value) {
   return String(value).trim();
 }
 
+function getParam(req, ...keys) {
+  const query = req.query || {};
+  const body = getSafeBody(req);
+  for (const key of keys) {
+    const fromQuery = getQueryString(query[key]);
+    if (fromQuery) return fromQuery;
+    const fromBody = getQueryString(body[key]);
+    if (fromBody) return fromBody;
+  }
+  return '';
+}
+
 function getClientIp(req) {
   const raw = String(req.ip || '').trim();
   if (!raw) return 'unknown';
   return raw.replace(/^::ffff:/, '').slice(0, 64);
+}
+
+function sanitizeUserIp(rawIp) {
+  const cleaned = String(rawIp || '').trim().replace(/^::ffff:/, '');
+  if (!cleaned || cleaned.includes('{') || cleaned.length > 64) return null;
+  if (!/^[0-9a-fA-F.:]+$/.test(cleaned)) return null;
+  return cleaned;
 }
 
 function isValidUid(uid) {
@@ -153,9 +173,19 @@ function pickWeightedIndex(weights) {
 }
 
 // ==========================================
-// دوال التدقيق المالي ومراقبة الـ IP (Ledger & Audit)
+// دوال التدقيق المالي ومراقبة الـ IP والـ Chargeback (Ledger & Audit)
 // ==========================================
-function buildAuditUpdate(auditData, { sourceKey, earnedCoins = 0, redeemedCoins = 0, ip = null }) {
+function buildAuditUpdate(
+  auditData,
+  {
+    sourceKey,
+    earnedCoins = 0,
+    redeemedCoins = 0,
+    chargebackCoins = 0,
+    unrecoveredDebt = 0,
+    ip = null,
+  }
+) {
   const data = auditData || {};
   const prevIp = typeof data.lastIp === 'string' ? data.lastIp : '';
   const recentIps = Array.isArray(data.recentIps) ? data.recentIps.slice(0, 20) : [];
@@ -196,6 +226,9 @@ function buildAuditUpdate(auditData, { sourceKey, earnedCoins = 0, redeemedCoins
     : {};
   let totalEarned = Number(data.totalEarned || 0);
   let totalRedeemed = Number(data.totalRedeemed || 0);
+  let chargebackCount = Number(data.chargebackCount || 0);
+  let totalChargebackCoins = Number(data.chargebackCoins || 0);
+  let unrecoveredChargebackDebt = Number(data.unrecoveredChargebackDebt || 0);
 
   if (sourceKey && earnedCoins > 0) {
     prevBreakdown[sourceKey] = Number(prevBreakdown[sourceKey] || 0) + earnedCoins;
@@ -209,6 +242,17 @@ function buildAuditUpdate(auditData, { sourceKey, earnedCoins = 0, redeemedCoins
     update.totalRedeemed = totalRedeemed;
   }
 
+  if (chargebackCoins > 0) {
+    chargebackCount += 1;
+    totalChargebackCoins += chargebackCoins;
+    unrecoveredChargebackDebt += Math.max(0, unrecoveredDebt);
+    flags.add('HAS_CHARGEBACK');
+    update.chargebackCount = chargebackCount;
+    update.chargebackCoins = totalChargebackCoins;
+    update.unrecoveredChargebackDebt = unrecoveredChargebackDebt;
+    update.lastChargebackAt = admin.firestore.FieldValue.serverTimestamp();
+  }
+
   update.flags = Array.from(flags);
 
   return {
@@ -217,6 +261,9 @@ function buildAuditUpdate(auditData, { sourceKey, earnedCoins = 0, redeemedCoins
     earnedBreakdown: prevBreakdown,
     totalEarned,
     totalRedeemed,
+    chargebackCount,
+    chargebackCoins: totalChargebackCoins,
+    unrecoveredChargebackDebt,
     uniqueIpCount: recentIps.length,
     ipChangeCount,
     lastIp: update.lastIp || prevIp || 'unknown',
@@ -419,15 +466,78 @@ app.get('/delete-account', (req, res) => {
 });
 
 // ==========================================
-// 1. مسارات الـ Postback (UPWALL & AdMantum)
+// 1. مسارات الـ Postback (UPWALL & AdMantum) مع دعم Chargeback / Reversal
 // ==========================================
-async function creditUserCoins(uid, amount, network, offerId, postbackIp = 'postback') {
+function isReversalPostback(req, numericAmount) {
+  if (numericAmount < 0) return true;
+
+  const reversalValues = new Set([
+    '0', '2', '-1',
+    'reversed', 'reversal', 'chargeback',
+    'rejected', 'cancelled', 'canceled', 'declined', 'fraud', 'deduct',
+  ]);
+
+  const statusVal = getParam(req, 'status', 'event_status').toLowerCase();
+  const typeVal = getParam(req, 'type', 'action', 'event_type').toLowerCase();
+  const cbFlag = getParam(req, 'chargeback', 'is_reversal').toLowerCase();
+
+  if (statusVal && reversalValues.has(statusVal)) return true;
+  if (typeVal && reversalValues.has(typeVal)) return true;
+  if (cbFlag === '1' || cbFlag === 'true') return true;
+  return false;
+}
+
+async function flagPendingRedemptionsOnChargeback(uid, network, coinsDeducted, txId) {
+  try {
+    const reqSnap = await db
+      .collection('redemption_requests')
+      .where('userId', '==', uid)
+      .where('status', '==', 'pending')
+      .limit(50)
+      .get();
+
+    if (reqSnap.empty) return;
+
+    const batch = db.batch();
+    reqSnap.docs.forEach((doc) => {
+      const auditRef = db.collection('redemption_audits').doc(doc.id);
+      batch.set(auditRef, {
+        riskLevel: 'HIGH',
+        riskFlags: admin.firestore.FieldValue.arrayUnion(
+          'HAS_CHARGEBACK',
+          'POST_REDEEM_CHARGEBACK'
+        ),
+        postRedeemChargebackCoins: admin.firestore.FieldValue.increment(coinsDeducted),
+        lastChargebackNetwork: network,
+        lastChargebackTxId: txId,
+        lastChargebackAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+    });
+
+    await batch.commit();
+    console.warn(`🚨 Flagged ${reqSnap.size} pending redemption(s) for user ${uid} after ${network} chargeback.`);
+  } catch (err) {
+    console.error('⚠️ Failed to flag pending redemptions after chargeback:', err.message);
+  }
+}
+
+async function processOfferPostback({
+  uid,
+  amount,
+  network,
+  offerId,
+  isReversal = false,
+  postbackIp = 'postback',
+  userOfferIp = null,
+}) {
   const cleanUid = String(uid || '').trim();
   const numericAmount = Number(amount);
-  const coinsToAdd = Math.floor(numericAmount);
+  const reversal = isReversal === true || numericAmount < 0;
+  const coinsAbs = Math.floor(Math.abs(numericAmount));
   const cleanOfferId = String(offerId || '').trim();
+  const validUserIp = sanitizeUserIp(userOfferIp);
 
-  if (!isValidUid(cleanUid) || !Number.isFinite(numericAmount) || coinsToAdd <= 0 || coinsToAdd > MAX_SINGLE_REWARD) {
+  if (!isValidUid(cleanUid) || !Number.isFinite(numericAmount) || coinsAbs <= 0 || coinsAbs > MAX_SINGLE_REWARD) {
     const err = new Error('Invalid userId or reward amount');
     err.statusCode = 400;
     throw err;
@@ -441,52 +551,130 @@ async function creditUserCoins(uid, amount, network, offerId, postbackIp = 'post
 
   const safeUid = sanitizeDocId(cleanUid, 128);
   const safeOfferId = sanitizeDocId(cleanOfferId, 120);
-  const txId = `${network}_${safeOfferId}_${safeUid}`;
+  // فصل معرّف الإلغاء (REV_) حتى لا يتعارض مع معرّف الإضافة الأصلي ويمنع تكرار الخصم
+  const txId = reversal
+    ? `REV_${network}_${safeOfferId}_${safeUid}`
+    : `${network}_${safeOfferId}_${safeUid}`;
 
   const txRef = db.collection('completed_offers').doc(txId);
   const userRef = db.collection('users').doc(cleanUid);
   const challengeRef = userRef.collection('activity').doc('challenges');
   const auditRef = userRef.collection('audit').doc('security');
 
+  let processedReversal = false;
+
   await db.runTransaction(async (t) => {
     const txDoc = await t.get(txRef);
     if (txDoc.exists) {
-      console.log(`⚠️ Duplicate postback ignored: ${txId}`);
+      console.log(`⚠️ Duplicate ${reversal ? 'reversal' : 'postback'} ignored: ${txId}`);
       return;
     }
 
     const userDoc = await t.get(userRef);
     if (!userDoc.exists) {
+      if (reversal) {
+        console.warn(`⚠️ Reversal received for deleted/missing user ${cleanUid}: ${txId}`);
+        return;
+      }
       const err = new Error('User not found');
       err.statusCode = 400;
       throw err;
     }
 
     const userData = userDoc.data() || {};
-    if (userData.isBanned === true) {
+    if (!reversal && userData.isBanned === true) {
       const err = new Error('User is banned');
       err.statusCode = 400;
       throw err;
     }
 
     const auditDoc = await t.get(auditRef);
-    const auditResult = buildAuditUpdate(
-      auditDoc.exists ? auditDoc.data() : {},
-      { sourceKey: 'offer', earnedCoins: coinsToAdd, ip: null }
-    );
+    const challengeDoc = (reversal && coinsAbs >= MIN_OFFER_COINS_FOR_CHALLENGE)
+      ? await t.get(challengeRef)
+      : null;
 
     const currentCoins = Number(userData.coins || 0);
     const currentNotifications = Array.isArray(userData.notifications)
       ? userData.notifications
       : [];
 
+    if (reversal) {
+      const actualDeducted = Math.min(Math.max(0, currentCoins), coinsAbs);
+      const unrecoveredDebt = coinsAbs - actualDeducted;
+      const newBalance = Math.max(0, currentCoins - coinsAbs);
+
+      const auditResult = buildAuditUpdate(
+        auditDoc.exists ? auditDoc.data() : {},
+        {
+          sourceKey: null,
+          chargebackCoins: coinsAbs,
+          unrecoveredDebt,
+          ip: validUserIp,
+        }
+      );
+
+      t.update(userRef, {
+        coins: newBalance,
+        lastUpdate: admin.firestore.FieldValue.serverTimestamp(),
+        notifications: [
+          {
+            title: '⚠️ تعديل رصيد (استرجاع عرض)',
+            body: `تم خصم ${coinsAbs} عملة بسبب إلغاء عرض من قِبل المعلِن (${network}).`,
+            time: 'الآن',
+          },
+          ...currentNotifications.slice(0, 19),
+        ],
+      });
+
+      t.set(txRef, {
+        type: 'chargeback',
+        uid: cleanUid,
+        network,
+        coins: -coinsAbs,
+        actualDeducted,
+        unrecoveredDebt,
+        offerId: cleanOfferId,
+        postbackIp,
+        userOfferIp: validUserIp || 'unknown',
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      if (challengeDoc && challengeDoc.exists) {
+        const prevCount = Number(challengeDoc.data()?.monlix_count || 0);
+        if (prevCount > 0) {
+          t.set(challengeRef, {
+            monlix_count: prevCount - 1,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          }, { merge: true });
+        }
+      }
+
+      t.set(auditRef, auditResult.update, { merge: true });
+      writeLedgerEntry(t, userRef, {
+        type: 'chargeback',
+        amount: -coinsAbs,
+        source: network,
+        ip: validUserIp || postbackIp,
+        meta: { offerId: cleanOfferId, txId, actualDeducted, unrecoveredDebt },
+      });
+
+      processedReversal = true;
+      return;
+    }
+
+    // حالة الإضافة الطبيعية
+    const auditResult = buildAuditUpdate(
+      auditDoc.exists ? auditDoc.data() : {},
+      { sourceKey: 'offer', earnedCoins: coinsAbs, ip: validUserIp }
+    );
+
     t.update(userRef, {
-      coins: currentCoins + coinsToAdd,
+      coins: currentCoins + coinsAbs,
       lastUpdate: admin.firestore.FieldValue.serverTimestamp(),
       notifications: [
         {
           title: '🎉 مكافأة عرض جديدة!',
-          body: `تمت إضافة ${coinsToAdd} عملة افتراضية من جدار عروض ${network}`,
+          body: `تمت إضافة ${coinsAbs} عملة افتراضية من جدار عروض ${network}`,
           time: 'الآن',
         },
         ...currentNotifications.slice(0, 19),
@@ -494,16 +682,18 @@ async function creditUserCoins(uid, amount, network, offerId, postbackIp = 'post
     });
 
     t.set(txRef, {
+      type: 'credit',
       uid: cleanUid,
       network,
-      coins: coinsToAdd,
+      coins: coinsAbs,
       offerId: cleanOfferId,
       postbackIp,
+      userOfferIp: validUserIp || 'unknown',
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
     // احتساب العرض ضمن تحدي الـ 5 عروض فقط إذا كانت قيمته 20 عملة فأكثر
-    if (coinsToAdd >= MIN_OFFER_COINS_FOR_CHALLENGE) {
+    if (coinsAbs >= MIN_OFFER_COINS_FOR_CHALLENGE) {
       t.set(challengeRef, {
         monlix_count: admin.firestore.FieldValue.increment(1),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -513,80 +703,113 @@ async function creditUserCoins(uid, amount, network, offerId, postbackIp = 'post
     t.set(auditRef, auditResult.update, { merge: true });
     writeLedgerEntry(t, userRef, {
       type: 'offer',
-      amount: coinsToAdd,
+      amount: coinsAbs,
       source: network,
-      ip: postbackIp,
+      ip: validUserIp || postbackIp,
       meta: { offerId: cleanOfferId, txId },
     });
   });
+
+  if (processedReversal) {
+    await flagPendingRedemptionsOnChargeback(cleanUid, network, coinsAbs, txId);
+  }
+
+  return { reversal, coins: coinsAbs };
 }
 
-app.get('/upwall-postback', postbackLimiter, async (req, res) => {
+async function handleUpwallPostback(req, res) {
   try {
     const expectedPassword = (process.env.UPWALL_POSTBACK_PASSWORD || '').trim();
-    const providedPassword = getQueryString(req.query.password || req.query.secret);
+    const providedPassword = getParam(req, 'password', 'secret');
 
     if (!isValidSecret(providedPassword, expectedPassword)) {
       console.warn(`🚫 Unauthorized UPWALL postback attempt from IP: ${req.ip}`);
       return res.status(403).send('Forbidden');
     }
 
-    const subId = getQueryString(req.query.subId || req.query.userid);
-    const reward = getQueryString(req.query.reward || req.query.user_amount);
-    const offerId = getQueryString(
-      req.query.transId ||
-      req.query.transaction_id ||
-      req.query.tx_id ||
-      req.query.offerId ||
-      req.query.offer_id
-    );
+    const subId = getParam(req, 'subId', 'userid', 'uid');
+    const reward = getParam(req, 'reward', 'user_amount', 'amount');
+    const offerId = getParam(req, 'transId', 'transaction_id', 'tx_id', 'offerId', 'offer_id');
+    const userOfferIp = getParam(req, 'ip', 'user_ip', 'userIp');
 
     if (!subId || !reward || !offerId) {
       return res.status(400).send('Missing required parameters');
     }
 
-    await creditUserCoins(subId, reward, 'UPWALL', offerId, getClientIp(req));
-    console.log(`✅ UPWALL: User ${subId} credited with ${reward} coins.`);
+    const reversal = isReversalPostback(req, Number(reward));
+    const result = await processOfferPostback({
+      uid: subId,
+      amount: reward,
+      network: 'UPWALL',
+      offerId,
+      isReversal: reversal,
+      postbackIp: getClientIp(req),
+      userOfferIp,
+    });
+
+    console.log(
+      result.reversal
+        ? `⚠️ UPWALL CHARGEBACK: User ${subId} deducted ${result.coins} coins.`
+        : `✅ UPWALL: User ${subId} credited with ${result.coins} coins.`
+    );
     return res.status(200).send('1');
   } catch (error) {
     console.error('❌ UPWALL Postback Error:', error.message);
     const code = error.statusCode || 500;
     return res.status(code).send('0');
   }
-});
+}
 
-app.get('/admantum-postback', postbackLimiter, async (req, res) => {
+async function handleAdmantumPostback(req, res) {
   try {
     const expectedSecret = (process.env.ADMANTUM_POSTBACK_SECRET || '').trim();
-    const providedSecret = getQueryString(req.query.secret || req.query.password);
+    const providedSecret = getParam(req, 'secret', 'password');
 
     if (!isValidSecret(providedSecret, expectedSecret)) {
       console.warn(`🚫 Unauthorized AdMantum postback attempt from IP: ${req.ip}`);
       return res.status(403).send('Forbidden');
     }
 
-    const uid = getQueryString(req.query.uid || req.query.subId);
-    const amount = getQueryString(req.query.amount || req.query.reward || req.query.virtual_currency);
-    const offerId = getQueryString(
-      req.query.transaction_id ||
-      req.query.tx_id ||
-      req.query.offer_id ||
-      req.query.of_id
-    );
+    const uid = getParam(req, 'uid', 'user_id', 'subId', 'subid');
+    const amount = getParam(req, 'amount', 'virtual_currency', 'reward');
+    const offerId = getParam(req, 'transaction_id', 'tx_id', 'offer_id', 'of_id');
+    const userOfferIp = getParam(req, 'ip', 'user_ip');
 
     if (!uid || !amount || !offerId) {
       return res.status(400).send('Missing required parameters');
     }
 
-    await creditUserCoins(uid, amount, 'AdMantum', offerId, getClientIp(req));
-    console.log(`✅ AdMantum: User ${uid} credited with ${amount} coins.`);
+    const reversal = isReversalPostback(req, Number(amount));
+    const result = await processOfferPostback({
+      uid,
+      amount,
+      network: 'AdMantum',
+      offerId,
+      isReversal: reversal,
+      postbackIp: getClientIp(req),
+      userOfferIp,
+    });
+
+    console.log(
+      result.reversal
+        ? `⚠️ AdMantum CHARGEBACK: User ${uid} deducted ${result.coins} coins.`
+        : `✅ AdMantum: User ${uid} credited with ${result.coins} coins.`
+    );
     return res.status(200).send('OK');
   } catch (error) {
     console.error('❌ AdMantum Postback Error:', error.message);
     const code = error.statusCode || 500;
     return res.status(code).send('ERROR');
   }
-});
+}
+
+app.route('/upwall-postback')
+  .get(postbackLimiter, handleUpwallPostback)
+  .post(postbackLimiter, handleUpwallPostback);
+
+app.route('/admantum-postback')
+  .get(postbackLimiter, handleAdmantumPostback)
+  .post(postbackLimiter, handleAdmantumPostback);
 
 // ==========================================
 // 2. مسار لوحة المتصدرين الآمن (بدون تسريب بيانات خاصة)
@@ -1059,7 +1282,10 @@ app.post('/api/redeem', apiLimiter, verifyAppCheck, verifyFirebaseToken, async (
     const clientIp = getClientIp(req);
     const body = getSafeBody(req);
     const rewardId = String(body.rewardId || '').trim();
-    const accountInfo = String(body.accountInfo || '').trim().slice(0, 200);
+    const accountInfo = String(body.accountInfo || '')
+      .replace(/[\r\n\t]+/g, ' ')
+      .trim()
+      .slice(0, 200);
 
     if (!Object.prototype.hasOwnProperty.call(REWARDS_CATALOG, rewardId)) {
       return res.status(400).json({ success: false, error: 'INVALID_REWARD' });
@@ -1132,13 +1358,16 @@ app.post('/api/redeem', apiLimiter, verifyAppCheck, verifyFirebaseToken, async (
       const riskFlags = new Set(auditResult.flags);
       if (sharedAccountUsers.length > 0) riskFlags.add('SHARED_PAYOUT_ACCOUNT');
       if (sameDeviceUsersCount > 1) riskFlags.add('MULTI_ACCOUNT_DEVICE');
-      if (auditResult.totalEarned > 0 && auditResult.totalRedeemed > auditResult.totalEarned + 100) {
+
+      const netEarned = Math.max(0, auditResult.totalEarned - auditResult.chargebackCoins);
+      if (auditResult.totalEarned > 0 && auditResult.totalRedeemed > netEarned + 100) {
         riskFlags.add('BALANCE_MISMATCH');
       }
 
       const flagList = Array.from(riskFlags);
       let riskLevel = 'LOW';
       if (
+        flagList.includes('HAS_CHARGEBACK') ||
         flagList.includes('SHARED_PAYOUT_ACCOUNT') ||
         flagList.includes('MULTI_ACCOUNT_DEVICE') ||
         flagList.includes('BALANCE_MISMATCH')
@@ -1194,6 +1423,9 @@ app.post('/api/redeem', apiLimiter, verifyAppCheck, verifyFirebaseToken, async (
         ipChangeCount: auditResult.ipChangeCount,
         totalEarnedTracked: auditResult.totalEarned,
         totalRedeemedTracked: auditResult.totalRedeemed,
+        chargebackCount: auditResult.chargebackCount,
+        chargebackCoins: auditResult.chargebackCoins,
+        unrecoveredChargebackDebt: auditResult.unrecoveredChargebackDebt,
         earnedBreakdown: auditResult.earnedBreakdown,
         balanceBeforeRedeem: serverCoins,
         balanceAfterRedeem: serverCoins - reward.cost,
